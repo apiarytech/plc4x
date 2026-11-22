@@ -267,16 +267,19 @@ func (s *SecureChannel) exchange(ctx context.Context, codec *MessageCodec, name 
 	}
 	responses := make(chan readWriteModel.OpcuaAPU, 1)
 	errs := make(chan error, 1)
+	// Only the first error counts. A second one follows when the connection fails during the
+	// write, and must not block: this runs under the transaction manager's lock.
+	report := func(err error) {
+		select {
+		case errs <- err:
+		default:
+		}
+	}
 	requestConsumer := func(transactionId int32) {
-		var decodeErr error
 		acceptsMessage := func(message spi.Message) bool {
 			apu, ok := message.(readWriteModel.OpcuaAPU)
 			if !ok {
 				return false
-			}
-			if serverErr, ok := apu.GetMessage().(readWriteModel.OpcuaMessageError); ok {
-				decodeErr = serverError(serverErr)
-				return true
 			}
 			decoded, err := s.decodeChunk(ctx, apu)
 			if err != nil {
@@ -286,29 +289,25 @@ func (s *SecureChannel) exchange(ctx context.Context, codec *MessageCodec, name 
 			return accept(decoded, transactionId)
 		}
 		handleMessage := func(message spi.Message) error {
-			if decodeErr != nil {
-				errs <- decodeErr
-				return nil
-			}
 			decoded, err := s.decodeChunk(ctx, message.(readWriteModel.OpcuaAPU))
 			if err != nil {
-				errs <- err
+				report(err)
 				return nil
 			}
 			responses <- decoded
 			return nil
 		}
 		handleError := func(err error) error {
-			errs <- err
+			report(err)
 			return nil
 		}
 		if err := codec.SendRequest(ctx, name, apus[0], acceptsMessage, handleMessage, handleError); err != nil {
-			errs <- err
+			report(err)
 			return
 		}
 		for _, apu := range apus[1:] {
 			if err := codec.Send(ctx, name, apu); err != nil {
-				errs <- err
+				report(err)
 				return
 			}
 		}

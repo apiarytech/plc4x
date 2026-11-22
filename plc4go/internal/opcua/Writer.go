@@ -121,12 +121,9 @@ func (m *Writer) WriteSync(ctx context.Context, writeRequest apiModel.PlcWriteRe
 		nil,
 		nil)
 
-	extObject := readWriteModel.NewExtensiblePayload(
-		nil,
-		readWriteModel.NewRootExtensionObject(
-			expandedNodeId,
-			opcuaWriteRequest,
-		),
+	extObject := readWriteModel.NewRootExtensionObject(
+		expandedNodeId,
+		opcuaWriteRequest,
 	)
 	buffer := utils.NewWriteBufferByteBased(utils.WithByteOrderForByteBasedBuffer(binary.LittleEndian))
 	if err := extObject.SerializeWithWriteBuffer(ctx, buffer); err != nil {

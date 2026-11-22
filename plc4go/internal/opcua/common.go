@@ -252,3 +252,24 @@ func readResponse(localLog zerolog.Logger, readRequestIn apiModel.PlcReadRequest
 	}
 	return
 }
+
+// responseCodeOf is the response code of an operation's status code.
+func responseCodeOf(status uint32) apiModel.PlcResponseCode {
+	if status&0x80000000 == 0 {
+		return apiModel.PlcResponseCode_OK
+	}
+	switch readWriteModel.OpcuaStatusCode(status & 0xFFFF0000) {
+	case readWriteModel.OpcuaStatusCode_BadNodeIdUnknown:
+		return apiModel.PlcResponseCode_NOT_FOUND
+	case readWriteModel.OpcuaStatusCode_BadNodeIdInvalid, readWriteModel.OpcuaStatusCode_BadAttributeIdInvalid:
+		return apiModel.PlcResponseCode_INVALID_ADDRESS
+	case readWriteModel.OpcuaStatusCode_BadUserAccessDenied, readWriteModel.OpcuaStatusCode_BadNotReadable,
+		readWriteModel.OpcuaStatusCode_BadNotWritable:
+		return apiModel.PlcResponseCode_ACCESS_DENIED
+	case readWriteModel.OpcuaStatusCode_BadTypeMismatch:
+		return apiModel.PlcResponseCode_INVALID_DATATYPE
+	case readWriteModel.OpcuaStatusCode_BadOutOfRange:
+		return apiModel.PlcResponseCode_OUT_OF_RANGE
+	}
+	return apiModel.PlcResponseCode_REMOTE_ERROR
+}

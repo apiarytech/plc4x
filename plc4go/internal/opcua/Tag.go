@@ -21,6 +21,7 @@ package opcua
 
 import (
 	"fmt"
+	"time"
 
 	apiModel "github.com/apache/plc4x/plc4go/pkg/api/model"
 	apiValues "github.com/apache/plc4x/plc4go/pkg/api/values"
@@ -83,6 +84,17 @@ func (t *tag) GetIdentifier() string {
 
 func (t *tag) GetIdentifierType() readWriteModel.OpcuaIdentifierType {
 	return t.identifierType
+}
+
+// GetPlcSubscriptionType makes a tag usable in a subscription; the request says how it is
+// subscribed to.
+func (t *tag) GetPlcSubscriptionType() apiModel.PlcSubscriptionType {
+	return apiModel.SubscriptionChangeOfState
+}
+
+// GetDuration is the tag's own sampling interval: none, the request gives it.
+func (t *tag) GetDuration() time.Duration {
+	return 0
 }
 
 func (t *tag) String() string {

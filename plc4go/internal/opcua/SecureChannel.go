@@ -24,6 +24,8 @@ import (
 	"crypto/rsa"
 	"crypto/x509"
 	"encoding/binary"
+	stderrors "errors"
+	"fmt"
 	"regexp"
 	"sync"
 	"sync/atomic"
@@ -226,14 +228,31 @@ func serverError(message readWriteModel.OpcuaMessageError) error {
 	return errors.Errorf("server reported an error: %s(0x%08X) %s", name, statusCode, reason)
 }
 
-// serviceFaultError turns a ServiceFault into an error.
-func serviceFaultError(fault readWriteModel.ServiceFault) error {
-	statusCode := fault.GetResponseHeader().GetServiceResult().GetStatusCode()
+// ServiceFaultError is a ServiceFault the server answered a request with.
+type ServiceFaultError struct {
+	Status uint32 // the service result
+}
+
+func (e *ServiceFaultError) Error() string {
 	name := ""
-	if status, ok := readWriteModel.OpcuaStatusCodeByValue(statusCode); ok {
+	if status, ok := readWriteModel.OpcuaStatusCodeByValue(e.Status); ok {
 		name = status.PLC4XEnumName() + " "
 	}
-	return errors.Errorf("server answered with a service fault: %s(0x%08X)", name, statusCode)
+	return fmt.Sprintf("server answered with a service fault: %s(0x%08X)", name, e.Status)
+}
+
+// serviceFaultError turns a ServiceFault into an error.
+func serviceFaultError(fault readWriteModel.ServiceFault) error {
+	return &ServiceFaultError{Status: fault.GetResponseHeader().GetServiceResult().GetStatusCode()}
+}
+
+// faultStatus is the service result of a ServiceFault err carries, 0 for another error.
+func faultStatus(err error) uint32 {
+	var fault *ServiceFaultError
+	if stderrors.As(err, &fault) {
+		return fault.Status
+	}
+	return 0
 }
 
 // exchange sends the chunks build makes for a transaction of count identifiers and waits for
@@ -845,8 +864,10 @@ func (s *SecureChannel) submit(ctx context.Context, codec *MessageCodec, errorDi
 				s.log.Trace().Int32("requestId", requestId).Int32("transactionId", transactionId).Msg("Not relevant")
 				return false
 			}
+			// A gap is normal when an earlier request was abandoned (its context ended) and its
+			// response went to no one.
 			if expected, got := s.senderSequenceNumber.Add(1), opcuaResponse.GetMessage().GetSequenceHeader().GetSequenceNumber(); expected != got {
-				s.log.Warn().
+				s.log.Debug().
 					Int32("expectedSequenceNumber", expected).
 					Int32("responseSequenceNumber", got).
 					Msg("Sequence number isn't as expected, we might have missed a packet")

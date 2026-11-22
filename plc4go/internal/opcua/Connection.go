@@ -93,6 +93,7 @@ func NewConnection(messageCodec *MessageCodec, configuration Configuration, driv
 		connection,
 		append(_options,
 			_default.WithPlcTagHandler(tagHandler),
+			_default.WithPlcValueHandler(NewValueHandler(_options...)),
 		)...,
 	)
 	return connection
@@ -197,6 +198,9 @@ func (c *Connection) prepareSecurity(ctx context.Context) error {
 func (c *Connection) Close() error {
 	ctx, cancelFunc := context.WithTimeout(context.Background(), c.disconnectTimeout)
 	defer cancelFunc()
+	for _, subscriber := range c.subscribers {
+		subscriber.stopAll()
+	}
 	c.channel.onDisconnect(ctx, c)
 	if err := c.messageCodec.Disconnect(); err != nil {
 		c.log.Debug().Err(err).Msg("Error disconnecting message codec")
@@ -242,8 +246,7 @@ func (c *Connection) SubscriptionRequestBuilder() apiModel.PlcSubscriptionReques
 }
 
 func (c *Connection) UnsubscriptionRequestBuilder() apiModel.PlcUnsubscriptionRequestBuilder {
-	// TODO: where do we get the unsubscriber from
-	return nil
+	return spiModel.NewDefaultPlcUnsubscriptionRequestBuilder()
 }
 
 func (c *Connection) BrowseRequestBuilder() apiModel.PlcBrowseRequestBuilder {

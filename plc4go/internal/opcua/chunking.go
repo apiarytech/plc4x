@@ -74,6 +74,9 @@ func (s *SecureChannel) splitBody(body []byte) ([][]byte, error) {
 		sendBufferSize = int(DEFAULT_SEND_BUFFER_SIZE)
 	}
 	maxBodySize := sendBufferSize - CHUNK_OVERHEAD
+	if s.security != nil {
+		maxBodySize = s.security.maxSymmetricBodySize(sendBufferSize)
+	}
 	if maxBodySize <= 0 {
 		return nil, errors.Errorf("send buffer size %d leaves no room for a message body", sendBufferSize)
 	}

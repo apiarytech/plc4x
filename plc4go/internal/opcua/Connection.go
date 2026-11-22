@@ -21,6 +21,7 @@ package opcua
 
 import (
 	"context"
+	"crypto/x509"
 	"slices"
 	"sync"
 	"time"
@@ -35,7 +36,6 @@ import (
 	spiModel "github.com/apache/plc4x/plc4go/spi/model"
 	"github.com/apache/plc4x/plc4go/spi/options"
 	"github.com/apache/plc4x/plc4go/spi/tracer"
-	"github.com/apache/plc4x/plc4go/spi/utils"
 )
 
 //go:generate go tool plc4xGenerator -type=Connection
@@ -49,6 +49,8 @@ type Connection struct {
 	driverContext DriverContext `stringer:"true"`
 
 	channel *SecureChannel
+	// newDiscoveryCodec opens another connection to the server, for discovering its endpoints.
+	newDiscoveryCodec func() (*MessageCodec, error) `ignore:"true"`
 
 	connectEvent      chan struct{}
 	connectTimeout    time.Duration // TODO: do we need to have that in general, where to get that from
@@ -118,16 +120,12 @@ func (c *Connection) GetMessageCodec() spi.MessageCodec {
 
 func (c *Connection) Connect(ctx context.Context) error {
 	c.log.Trace().Msg("Connecting")
+	if err := c.prepareSecurity(ctx); err != nil {
+		return errors.Wrap(err, "Error preparing the secure channel")
+	}
 	c.log.Trace().Msg("connecting codec")
 	if err := c.messageCodec.Connect(ctx); err != nil {
 		return errors.Wrap(err, "Error connecting codec")
-	}
-
-	if c.driverContext.fireDiscoverEvent {
-		c.log.Trace().Msg("calling onDiscover")
-		c.channel.onDiscover(ctx, c.messageCodec)
-	} else {
-		c.log.Trace().Msg("we don't wait for session discover")
 	}
 
 	// For testing purposes we can skip the waiting for a complete connection
@@ -150,19 +148,61 @@ func (c *Connection) Connect(ctx context.Context) error {
 	return nil
 }
 
-func (c *Connection) Close() error {
-	ctx := context.TODO()
-	ctx, cancelFunc := utils.WithNamedTimeout(ctx, "connection close timeout", 5*time.Second)
-	defer cancelFunc()
-
-	c.channel.onDisconnect(ctx, c)
-	disconnectTimeout := time.NewTimer(c.disconnectTimeout)
-	select {
-	case <-c.disconnectEvent:
-		c.log.Info().Msg("disconnected")
-	case <-disconnectTimeout.C:
-		return errors.Errorf("timeout after %s", c.disconnectTimeout)
+// prepareSecurity gives the channel what its security policy needs: the client's certificate
+// and key, and the server's certificate - pinned with server-certificate-file or discovered on
+// a connection of its own - once it is trusted.
+func (c *Connection) prepareSecurity(ctx context.Context) error {
+	policy, err := c.configuration.securityPolicy()
+	if err != nil {
+		return err
 	}
+	if policy.isNone() {
+		return c.channel.prepareSecurity(clientIdentity{}, nil)
+	}
+	if c.configuration.KeyStoreFile != "" {
+		return errors.New("tls.keystore (a PKCS#12 key store) is not supported by this driver: " +
+			"put the client certificate and key as PEM files into cert-directory instead")
+	}
+	identity, err := loadClientIdentity(c.log, c.configuration.CertDirectory, c.configuration.GeneratedKeySize, *APPLICATION_URI.GetStringValue())
+	if err != nil {
+		return errors.Wrap(err, "error loading the client certificate")
+	}
+	trust, err := newServerTrust(c.log, c.configuration)
+	if err != nil {
+		return err
+	}
+	var chain []*x509.Certificate
+	switch {
+	case trust.pinned != nil:
+		chain = []*x509.Certificate{trust.pinned}
+	case !c.configuration.Discovery:
+		return errors.Errorf("security policy %s needs the server's certificate: name it with server-certificate-file, or turn discovery on", policy.name)
+	case c.newDiscoveryCodec == nil:
+		return errors.New("no way to open a discovery connection")
+	default:
+		codec, err := c.newDiscoveryCodec()
+		if err != nil {
+			return errors.Wrap(err, "error opening the discovery connection")
+		}
+		if chain, err = discoverServerCertificate(ctx, c.log, c.configuration, codec); err != nil {
+			return err
+		}
+	}
+	if err := trust.verify(chain); err != nil {
+		return errors.Wrap(err, "the server's certificate is not trusted")
+	}
+	return c.channel.prepareSecurity(identity, chain[0])
+}
+
+func (c *Connection) Close() error {
+	ctx, cancelFunc := context.WithTimeout(context.Background(), c.disconnectTimeout)
+	defer cancelFunc()
+	c.channel.onDisconnect(ctx, c)
+	if err := c.messageCodec.Disconnect(); err != nil {
+		c.log.Debug().Err(err).Msg("Error disconnecting message codec")
+	}
+	c.SetConnected(false)
+	c.log.Info().Msg("disconnected")
 	return nil
 }
 
@@ -216,22 +256,11 @@ func (c *Connection) addSubscriber(subscriber *Subscriber) {
 
 func (c *Connection) setupConnection(ctx context.Context) error {
 	c.log.Trace().Msg("setup connection")
-
-	c.log.Debug().Msg("Opcua Driver running in ACTIVE mode.")
 	if err := c.channel.onConnect(ctx, c); err != nil {
+		c.fireConnectionError(err, make(chan error, 1))
 		return errors.Wrap(err, "Error during connection setup")
 	}
-
-	connectTimeout := time.NewTimer(c.connectTimeout)
-	select {
-	case <-c.connectEvent:
-		c.log.Info().Msg("connected")
-		c.SetConnected(true)
-		c.log.Trace().Msg("Connect fired")
-	case <-connectTimeout.C:
-		return errors.Errorf("timeout after %s", c.connectTimeout)
-	}
-
+	c.fireConnected(make(chan struct{}, 1))
 	c.log.Trace().Msg("connection setup done")
 	return nil
 }

@@ -20,8 +20,6 @@
 package opcua
 
 import (
-	"os"
-	"path"
 	"reflect"
 	"strconv"
 	"strings"
@@ -41,25 +39,34 @@ type Configuration struct {
 	Endpoint          string
 	TransportEndpoint string
 	Params            string
-	IsEncrypted       bool
-	Thumbprint        readWriteModel.PascalByteString
-	SenderCertificate []byte
 	Discovery         bool
 	Username          string
 	// The credentials below render as <redacted>, never as their values - see the generator's
 	// secret tag. Username is not marked: it says who is connecting, which is a diagnostic.
-	Password         string `secret:"true"`
-	SecurityPolicy   string
+	Password       string `secret:"true"`
+	SecurityPolicy string
+	// MessageSecurity is SIGN or SIGN_ENCRYPT: what a channel with a security policy other than
+	// None does to the messages after the handshake.
+	MessageSecurity string
+	// KeyStoreFile and KeyStorePassword name a PKCS#12 key store, as PLC4J reads one. This binding
+	// does not read PKCS#12; it takes its certificate from CertDirectory instead.
 	KeyStoreFile     string
-	CertDirectory    string
 	KeyStorePassword string `secret:"true"`
-	// Ckp holds the client's private key. Rendering it prints pointer addresses rather than key
-	// material, so nothing leaks today - but a struct that holds a key by value later would, and
-	// a field whose contents must never be printed should say so where it is declared.
-	Ckp *CertificateKeyPair `secret:"true"`
-	// AllowUnverifiedSecurityPolicies is an explicit opt-in for security policies other than "None".
-	// The plc4go OPC UA secure-channel implementation does not verify server certificates or message
-	// signatures yet, so any other policy is refused unless this is set to true.
+	// CertDirectory holds the client's certificate and key as PEM files. They are generated
+	// there on first use, so the server can be told to trust one certificate for good.
+	CertDirectory    string
+	GeneratedKeySize int
+	// ServerCertificateFile pins the server's certificate (DER or PEM); TrustStore names PEM or
+	// DER certificates, a file or a directory, that a server's certificate must chain to.
+	// VerifyServerCertificate false trusts any server certificate: for tests only.
+	ServerCertificateFile   string
+	TrustStore              string
+	VerifyServerCertificate bool
+	// AllowInsecureCredentials allows a password to be sent where nothing encrypts it.
+	AllowInsecureCredentials bool
+	// AllowUnverifiedSecurityPolicies was the opt-in for security policies before the driver
+	// verified certificates and signatures. It is read so old connection strings still parse,
+	// and has no effect.
 	AllowUnverifiedSecurityPolicies bool
 
 	log zerolog.Logger
@@ -75,13 +82,19 @@ type Configuration struct {
 // Keys are lower-case; lookup lower-cases the option, which keeps the case-insensitive matching
 // this driver has always had.
 var fieldForOption = map[string]string{
-	"discovery":             "Discovery",
-	"username":              "Username",
-	"password":              "Password",
-	"security-policy":       "SecurityPolicy",
-	"tls.keystore":          "KeyStoreFile",
-	"tls.keystore-password": "KeyStorePassword",
-	// No PLC4J counterpart: this binding generates its certificate into a directory rather than
+	"discovery":                  "Discovery",
+	"username":                   "Username",
+	"password":                   "Password",
+	"security-policy":            "SecurityPolicy",
+	"message-security":           "MessageSecurity",
+	"tls.keystore":               "KeyStoreFile",
+	"tls.keystore-password":      "KeyStorePassword",
+	"generated-key-size":         "GeneratedKeySize",
+	"server-certificate-file":    "ServerCertificateFile",
+	"tls.trust-store":            "TrustStore",
+	"tls.verify":                 "VerifyServerCertificate",
+	"allow-insecure-credentials": "AllowInsecureCredentials",
+	// No PLC4J counterpart: this binding keeps its certificate in a directory rather than
 	// taking a key store, so the name is this binding's own - in the shared spelling.
 	"cert-directory":                     "CertDirectory",
 	"allow-unverified-security-policies": "AllowUnverifiedSecurityPolicies",
@@ -125,6 +138,12 @@ func ParseFromOptions(log zerolog.Logger, options map[string][]string) (Configur
 		switch field.Kind() {
 		case reflect.String:
 			field.SetString(optionValue)
+		case reflect.Int:
+			parseInt, err := strconv.ParseInt(optionValue, 0, 32)
+			if err != nil {
+				return Configuration{}, errors.Wrapf(err, "Error parsing %s", optionKey)
+			}
+			field.SetInt(parseInt)
 		case reflect.Uint8:
 			parseUint, err := strconv.ParseUint(optionValue, 0, 8)
 			if err != nil {
@@ -148,58 +167,56 @@ func ParseFromOptions(log zerolog.Logger, options map[string][]string) (Configur
 	return configuration, nil
 }
 
-// validateSecurityPolicy refuses security policies the driver cannot actually enforce: the
-// secure-channel implementation performs no certificate or message-signature verification yet,
-// so requesting anything but "None" must fail closed unless the user explicitly opted in.
+// validateSecurityPolicy checks the security options name things the driver knows.
 func (c *Configuration) validateSecurityPolicy() error {
-	if c.SecurityPolicy == "" || c.SecurityPolicy == "None" {
-		return nil
+	policy, err := c.securityPolicy()
+	if err != nil {
+		return err
 	}
-	if !c.AllowUnverifiedSecurityPolicies {
-		return errors.Errorf("security-policy %s is not supported: the plc4go OPC UA driver does not verify server certificates or message signatures yet. "+
-			"Set allow-unverified-security-policies=true to connect anyway (NOT recommended for production use)", c.SecurityPolicy)
+	if _, err := c.messageSecurityMode(); err != nil {
+		return err
 	}
-	c.log.Warn().
-		Str("securityPolicy", c.SecurityPolicy).
-		Msg("allowUnverifiedSecurityPolicies is set: the requested security policy is used WITHOUT certificate or message-signature verification")
+	if c.AllowUnverifiedSecurityPolicies {
+		c.log.Warn().Msg("allow-unverified-security-policies no longer has an effect: the driver verifies server certificates and message signatures")
+	}
+	if !policy.isNone() && !c.VerifyServerCertificate {
+		c.log.Warn().Msg("tls.verify=false: the server's certificate is not verified. The connection is open to man-in-the-middle attacks; use this for tests only")
+	}
 	return nil
 }
 
-func (c *Configuration) openKeyStore() error {
-	c.IsEncrypted = true
-	securityTempDir := path.Join(c.CertDirectory, "security")
-	if _, err := os.Stat(securityTempDir); errors.Is(err, os.ErrNotExist) {
-		if err := os.Mkdir(securityTempDir, 700); err != nil {
-			return errors.New("Unable to create directory please confirm folder permissions on " + securityTempDir)
-		}
-	}
+// securityPolicy is the security policy the configuration asks for.
+func (c *Configuration) securityPolicy() (*securityPolicy, error) {
+	return securityPolicyByName(c.SecurityPolicy)
+}
 
-	serverKeyStore := path.Join(securityTempDir, c.KeyStoreFile)
-	if _, err := os.Stat(securityTempDir); errors.Is(err, os.ErrNotExist) {
-		var err error
-		c.Ckp, err = generateCertificate()
-		if err != nil {
-			return errors.Wrap(err, "error generating certificate")
-		}
-		c.log.Info().Str("serverKeyStore", serverKeyStore).Msg("Creating keystore")
-		// TODO: not sure how to do that in golang. Seems pkc12 can only decode for now
-		_ = os.WriteFile(serverKeyStore, []byte{0xA}, 0700)
-	} else {
-		c.log.Info().Str("serverKeyStore", serverKeyStore).Msg("Loading keystore")
-		serverKeyStoreContent, err := os.ReadFile(serverKeyStore)
-		if err != nil {
-			return errors.Wrap(err, "error reading "+serverKeyStore)
-		}
-		// TODO: here we can parse with "golang.org/x/crypto/pkcs12" Decode
-		_ = serverKeyStoreContent
+// messageSecurityMode is the message security mode the configuration asks for: None for the
+// None policy, Sign or SignAndEncrypt otherwise.
+func (c *Configuration) messageSecurityMode() (readWriteModel.MessageSecurityMode, error) {
+	policy, err := c.securityPolicy()
+	if err != nil {
+		return 0, err
 	}
-
-	return nil
+	if policy.isNone() {
+		return readWriteModel.MessageSecurityMode_messageSecurityModeNone, nil
+	}
+	switch strings.ToUpper(strings.ReplaceAll(c.MessageSecurity, "-", "_")) {
+	case "SIGN":
+		return readWriteModel.MessageSecurityMode_messageSecurityModeSign, nil
+	case "", "SIGN_ENCRYPT", "SIGNANDENCRYPT", "SIGN_AND_ENCRYPT":
+		return readWriteModel.MessageSecurityMode_messageSecurityModeSignAndEncrypt, nil
+	default:
+		return 0, errors.Errorf("unknown message-security %q: use SIGN or SIGN_ENCRYPT", c.MessageSecurity)
+	}
 }
 
 func createDefaultConfiguration() Configuration {
 	return Configuration{
-		SecurityPolicy: "None",
+		SecurityPolicy:          "None",
+		MessageSecurity:         "SIGN_ENCRYPT",
+		GeneratedKeySize:        2048,
+		VerifyServerCertificate: true,
+		Discovery:               true,
 	}
 }
 

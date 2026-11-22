@@ -55,13 +55,8 @@ func newChunkTestRig(t *testing.T, sendBufferSize int) *chunkTestRig {
 	require.NoError(t, codec.Connect(testutils.TestContext(t)))
 	t.Cleanup(func() { _ = codec.Disconnect() })
 
-	log := zerolog.Nop()
-	channel := &SecureChannel{
-		log:                       log,
-		channelTransactionManager: NewSecureChannelTransactionManager(log),
-		encryptionHandler:         NewEncryptionHandler(log, nil, nil, "None"),
-		sendBufferSize:            sendBufferSize,
-	}
+	channel := NewSecureChannel(zerolog.Nop(), DriverContext{}, Configuration{SecurityPolicy: "None"})
+	channel.sendBufferSize = sendBufferSize
 	channel.channelId.Store(7)
 	channel.tokenId.Store(1)
 	return &chunkTestRig{

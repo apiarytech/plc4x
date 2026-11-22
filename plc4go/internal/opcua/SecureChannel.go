@@ -112,8 +112,9 @@ type SecureChannel struct {
 	keepAliveStateChange      sync.Mutex
 	keepAliveIndicator        atomic.Bool
 	keepAliveWg               sync.WaitGroup
-	sendBufferSize            int
-	maxMessageSize            int
+	sendBufferSize            int // largest chunk the server accepts, from its Acknowledge (see applyServerLimits)
+	maxMessageSize            int // largest message the server accepts; 0: no limit
+	maxChunkCount             int // most chunks per message the server accepts; 0: no limit
 	endpoints                 []string
 	senderSequenceNumber      atomic.Int32
 
@@ -199,42 +200,60 @@ func (s *SecureChannel) goWithRecover(connection *Connection, errChan chan error
 }
 
 func (s *SecureChannel) submit(ctx context.Context, codec *MessageCodec, errorDispatcher func(err error), consumer func(opcuaResponse []byte), buffer utils.WriteBufferByteBased) {
-	transactionId := s.channelTransactionManager.getTransactionIdentifier()
+	// A message larger than the server's receive buffer goes out in several chunks. Each chunk
+	// has its own sequence number, so the message reserves one transaction identifier per chunk:
+	// the first one is also the request id the response carries.
+	bodies, err := s.splitBody(buffer.GetBytes())
+	if err != nil {
+		errorDispatcher(err)
+		return
+	}
+	if s.isEncrypted && len(bodies) > 1 {
+		errorDispatcher(errors.Errorf("message of %d bytes needs %d chunks, and the driver cannot split a signed or encrypted message yet", len(buffer.GetBytes()), len(bodies)))
+		return
+	}
+	transactionId := s.channelTransactionManager.getTransactionIdentifiers(int32(len(bodies)))
 
-	//TODO: We need to split large messages up into chunks if it is larger than the sendBufferSize
-	//      This value is negotiated when opening a channel
-
-	messageRequest := readWriteModel.NewOpcuaMessageRequest(
-		readWriteModel.ChunkType_FINAL,
-		readWriteModel.NewSecurityHeader(
-			s.channelId.Load(),
-			s.tokenId.Load(),
-		),
-		readWriteModel.NewBinaryPayload(
-			readWriteModel.NewSequenceHeader(transactionId, transactionId),
-			buffer.GetBytes(),
-		),
-	)
-
-	var apu readWriteModel.OpcuaAPU
-	if s.isEncrypted {
-		message, err := s.encryptionHandler.encodeMessage(ctx, messageRequest, buffer.GetBytes())
-		if err != nil {
-			errorDispatcher(err)
-			return
+	apus := make([]readWriteModel.OpcuaAPU, 0, len(bodies))
+	for i, body := range bodies {
+		chunkType := readWriteModel.ChunkType_CONTINUE
+		if i == len(bodies)-1 {
+			chunkType = readWriteModel.ChunkType_FINAL
 		}
-		apu, err = readWriteModel.OpcuaAPUParse(ctx, message, false, true)
-		if err != nil {
-			errorDispatcher(err)
-			return
+		messageRequest := readWriteModel.NewOpcuaMessageRequest(
+			chunkType,
+			readWriteModel.NewSecurityHeader(
+				s.channelId.Load(),
+				s.tokenId.Load(),
+			),
+			readWriteModel.NewBinaryPayload(
+				readWriteModel.NewSequenceHeader(transactionId+int32(i), transactionId),
+				body,
+			),
+		)
+		if s.isEncrypted {
+			message, err := s.encryptionHandler.encodeMessage(ctx, messageRequest, body)
+			if err != nil {
+				errorDispatcher(err)
+				return
+			}
+			apu, err := readWriteModel.OpcuaAPUParse(ctx, message, false, true)
+			if err != nil {
+				errorDispatcher(err)
+				return
+			}
+			apus = append(apus, apu)
+		} else {
+			apus = append(apus, readWriteModel.NewOpcuaAPU(messageRequest))
 		}
-	} else {
-		apu = readWriteModel.NewOpcuaAPU(messageRequest)
 	}
 
 	requestConsumer := func(transactionId int32) {
-		var messageBuffer []byte
-		if err := codec.SendRequest(ctx, "submis", apu, func(message spi.Message) bool {
+		// The response may come in several chunks too: the expectation keeps collecting chunks
+		// of this request until the final one (or an abort) arrives.
+		var assembler chunkAssembler
+		var responseErr error
+		acceptsMessage := func(message spi.Message) bool {
 			opcuaAPU, ok := message.(readWriteModel.OpcuaAPU)
 			if !ok {
 				s.log.Debug().Type("type", message).Msg("Not relevant")
@@ -256,42 +275,70 @@ func (s *SecureChannel) submit(ctx context.Context, codec *MessageCodec, errorDi
 			if requestId := opcuaResponse.GetMessage().GetSequenceHeader().GetRequestId(); requestId != transactionId {
 				s.log.Debug().Int32("requestId", requestId).Int32("transactionId", transactionId).Msg("Not relevant")
 				return false
-			} else {
-				messageBuffer = opcuaResponse.(readWriteModel.BinaryPayload).GetPayload()
-				if !(s.senderSequenceNumber.Add(1) == (opcuaResponse.GetMessage().GetSequenceHeader().GetSequenceNumber())) {
-					s.log.Error().
-						Int32("senderSequenceNumber", s.senderSequenceNumber.Load()).
-						Int32("responseSequenceNumber", opcuaResponse.GetMessage().GetSequenceHeader().GetSequenceNumber()).
-						Msg("Sequence number isn't as expected, we might have missed a packet. - senderSequenceNumber != responseSequenceNumber")
-					errorDispatcher(errors.New("unexpected sequence number"))
-				}
 			}
-			return true
-		}, func(message spi.Message) error {
+			if !(s.senderSequenceNumber.Add(1) == (opcuaResponse.GetMessage().GetSequenceHeader().GetSequenceNumber())) {
+				s.log.Error().
+					Int32("senderSequenceNumber", s.senderSequenceNumber.Load()).
+					Int32("responseSequenceNumber", opcuaResponse.GetMessage().GetSequenceHeader().GetSequenceNumber()).
+					Msg("Sequence number isn't as expected, we might have missed a packet. - senderSequenceNumber != responseSequenceNumber")
+				errorDispatcher(errors.New("unexpected sequence number"))
+			}
+			payload, ok := opcuaResponse.GetMessage().(readWriteModel.BinaryPayload)
+			if !ok {
+				responseErr = errors.Errorf("unexpected payload %T", opcuaResponse.GetMessage())
+				return true
+			}
+			switch opcuaResponse.GetChunk() {
+			case readWriteModel.ChunkType_CONTINUE:
+				if err := assembler.add(payload.GetPayload()); err != nil {
+					responseErr = err
+					return true
+				}
+				s.log.Trace().Int("chunks", len(assembler.parts)).Msg("collected chunk")
+				return false // wait for the next chunk of this response
+			case readWriteModel.ChunkType_ABORT:
+				responseErr = abortError(payload.GetPayload())
+				return true
+			default:
+				if err := assembler.add(payload.GetPayload()); err != nil {
+					responseErr = err
+				}
+				return true
+			}
+		}
+		handleMessage := func(message spi.Message) error {
+			if responseErr != nil {
+				errorDispatcher(responseErr)
+				return nil
+			}
 			opcuaAPU := message.(readWriteModel.OpcuaAPU)
 			opcuaAPU, _ = s.encryptionHandler.decodeMessage(ctx, opcuaAPU)
-			messagePDU := opcuaAPU.GetMessage()
-			s.log.Trace().Interface("messagePDU", messagePDU).Msg("looking at messagePDU")
-			opcuaResponse := messagePDU.(readWriteModel.OpcuaMessageResponse)
-			if opcuaResponse.GetChunk() == (readWriteModel.ChunkType_FINAL) {
-				s.tokenId.Store(opcuaResponse.GetSecurityHeader().GetSecureTokenId())
-				s.channelId.Store(opcuaResponse.GetSecurityHeader().GetSecureChannelId())
-
-				consumer(messageBuffer)
-			} else {
-				s.log.Warn().Interface("chunk", opcuaResponse.GetChunk()).Msg("Message discarded")
+			opcuaResponse := opcuaAPU.GetMessage().(readWriteModel.OpcuaMessageResponse)
+			s.tokenId.Store(opcuaResponse.GetSecurityHeader().GetSecureTokenId())
+			s.channelId.Store(opcuaResponse.GetSecurityHeader().GetSecureChannelId())
+			consumer(assembler.message())
+			return nil
+		}
+		handleError := func(err error) error {
+			errorDispatcher(err)
+			return nil
+		}
+		// The expectation goes in with the first chunk: a server may answer before the last
+		// chunk of the request has been written (to abort it, say).
+		if err := codec.SendRequest(ctx, "submis", apus[0], acceptsMessage, handleMessage, handleError); err != nil {
+			errorDispatcher(err)
+			return
+		}
+		for _, apu := range apus[1:] {
+			if err := codec.Send(ctx, "submis", apu); err != nil {
+				errorDispatcher(err)
+				return
 			}
-			return nil
-		}, func(err error) error {
-			errorDispatcher(err)
-			return nil
-		}); err != nil {
-			errorDispatcher(err)
 		}
 	}
 
-	s.log.Debug().Int32("transactionId", transactionId).Msg("Submitting Transaction to TransactionManager")
-	if err := s.channelTransactionManager.submit(requestConsumer, transactionId); err != nil {
+	s.log.Debug().Int32("transactionId", transactionId).Int("chunks", len(apus)).Msg("Submitting Transaction to TransactionManager")
+	if err := s.channelTransactionManager.submitSpan(requestConsumer, transactionId, int32(len(apus))); err != nil {
 		s.log.Debug().Err(err).Msg("error submitting")
 	}
 }
@@ -361,6 +408,7 @@ func (s *SecureChannel) onConnect(ctx context.Context, connection *Connection) e
 }
 
 func (s *SecureChannel) onConnectOpenSecureChannel(ctx context.Context, connection *Connection, okChan chan struct{}, errChan chan error, response readWriteModel.OpcuaAcknowledgeResponse) {
+	s.applyServerLimits(response.GetLimits())
 	transactionId := s.channelTransactionManager.getTransactionIdentifier()
 
 	requestHeader := readWriteModel.NewRequestHeader(
@@ -942,6 +990,7 @@ func (s *SecureChannel) onDiscover(ctx context.Context, codec *MessageCodec) {
 
 func (s *SecureChannel) onDiscoverOpenSecureChannel(ctx context.Context, codec *MessageCodec, opcuaAcknowledgeResponse readWriteModel.OpcuaAcknowledgeResponse) {
 	s.log.Trace().Msg("onDiscoverOpenSecureChannel")
+	s.applyServerLimits(opcuaAcknowledgeResponse.GetLimits())
 	transactionId := s.channelTransactionManager.getTransactionIdentifier()
 
 	requestHeader := readWriteModel.NewRequestHeader(

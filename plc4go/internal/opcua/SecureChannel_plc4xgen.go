@@ -274,6 +274,10 @@ func (d *SecureChannel) SerializeWithWriteBuffer(ctx context.Context, writeBuffe
 	if err := writeBuffer.WriteInt64("maxMessageSize", 64, int64(d.maxMessageSize)); err != nil {
 		return err
 	}
+
+	if err := writeBuffer.WriteInt64("maxChunkCount", 64, int64(d.maxChunkCount)); err != nil {
+		return err
+	}
 	if err := writeBuffer.PushContext("endpoints", utils.WithRenderAsList(true)); err != nil {
 		return err
 	}

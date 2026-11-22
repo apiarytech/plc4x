@@ -125,6 +125,18 @@ func (d *Configuration) SerializeWithWriteBuffer(ctx context.Context, writeBuffe
 		return err
 	}
 
+	if err := writeBuffer.WriteInt64("browseMaxReferencesPerNode", 64, int64(d.BrowseMaxReferencesPerNode)); err != nil {
+		return err
+	}
+
+	if err := writeBuffer.WriteInt64("browseMaxTotalNodes", 64, int64(d.BrowseMaxTotalNodes)); err != nil {
+		return err
+	}
+
+	if err := writeBuffer.WriteInt64("browseMaxDepth", 64, int64(d.BrowseMaxDepth)); err != nil {
+		return err
+	}
+
 	if err := writeBuffer.WriteBit("allowUnverifiedSecurityPolicies", d.AllowUnverifiedSecurityPolicies); err != nil {
 		return err
 	}

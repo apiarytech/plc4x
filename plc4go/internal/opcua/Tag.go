@@ -48,11 +48,14 @@ type tag struct {
 	identifier     string
 	identifierType readWriteModel.OpcuaIdentifierType
 	dataType       readWriteModel.OpcuaDataType
+	arrayInfo      []apiModel.ArrayInfo // the shape a browse found, nil otherwise
 }
 
+// GetAddressString is the address the tag parses from: "ns=2;s=Line1", with ";DINT" when the
+// data type is known.
 func (t *tag) GetAddressString() string {
-	address := fmt.Sprintf("ns=%d;%s=%s", t.namespace, t.identifierType, t.identifier)
-	if t.dataType != "" {
+	address := fmt.Sprintf("ns=%d;%s=%s", t.namespace, t.identifierType.GetValue(), t.identifier)
+	if t.dataType != "" && t.dataType != readWriteModel.OpcuaDataType_NULL {
 		address += ";" + t.dataType.PLC4XEnumName()
 	}
 	return address
@@ -67,7 +70,7 @@ func (t *tag) GetValueType() apiValues.PlcValueType {
 }
 
 func (t *tag) GetArrayInfo() []apiModel.ArrayInfo {
-	return nil
+	return t.arrayInfo
 }
 
 func (t *tag) GetNamespace() int {

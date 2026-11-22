@@ -211,7 +211,7 @@ func (c *Connection) GetMetadata() apiModel.PlcConnectionMetadata {
 		ProvidesReading:     true,
 		ProvidesWriting:     true,
 		ProvidesSubscribing: true,
-		ProvidesBrowsing:    false,
+		ProvidesBrowsing:    true,
 	}
 }
 
@@ -244,6 +244,10 @@ func (c *Connection) SubscriptionRequestBuilder() apiModel.PlcSubscriptionReques
 func (c *Connection) UnsubscriptionRequestBuilder() apiModel.PlcUnsubscriptionRequestBuilder {
 	// TODO: where do we get the unsubscriber from
 	return nil
+}
+
+func (c *Connection) BrowseRequestBuilder() apiModel.PlcBrowseRequestBuilder {
+	return spiModel.NewDefaultPlcBrowseRequestBuilder(c.GetPlcTagHandler(), c)
 }
 
 func (c *Connection) addSubscriber(subscriber *Subscriber) {

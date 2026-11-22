@@ -64,6 +64,7 @@ type testServer struct {
 	username       string
 	password       string
 	opened         []readWriteModel.SecurityTokenRequestType
+	nodes          map[string]testNode
 	closed         bool
 	services       []string
 	failures       []error
@@ -312,6 +313,12 @@ func (s *testServer) service(request readWriteModel.ExtensionObjectDefinition) (
 			s.password = string(password)
 		}
 		return readWriteModel.NewActivateSessionResponse(s.responseHeader(request.GetRequestHeader().GetRequestHandle()), byteString(nil), nil, nil), nil
+	case readWriteModel.BrowseRequest:
+		return s.browse(request.GetRequestHeader(), request.GetNodesToBrowse()[0].GetNodeId(), nil)
+	case readWriteModel.BrowseNextRequest:
+		return s.browse(request.GetRequestHeader(), nil, request.GetContinuationPoints()[0].GetStringValue())
+	case readWriteModel.ReadRequest:
+		return s.read(request)
 	case readWriteModel.CloseSessionRequest:
 		return readWriteModel.NewCloseSessionResponse(s.responseHeader(request.GetRequestHeader().GetRequestHandle())), nil
 	}

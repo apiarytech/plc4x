@@ -64,6 +64,11 @@ type Configuration struct {
 	VerifyServerCertificate bool
 	// AllowInsecureCredentials allows a password to be sent where nothing encrypts it.
 	AllowInsecureCredentials bool
+	// Bounds of a browse, as in PLC4J: references collected per node, nodes expanded per query,
+	// and depth of the tree. 0 means no bound.
+	BrowseMaxReferencesPerNode int
+	BrowseMaxTotalNodes        int
+	BrowseMaxDepth             int
 	// AllowUnverifiedSecurityPolicies was the opt-in for security policies before the driver
 	// verified certificates and signatures. It is read so old connection strings still parse,
 	// and has no effect.
@@ -82,18 +87,21 @@ type Configuration struct {
 // Keys are lower-case; lookup lower-cases the option, which keeps the case-insensitive matching
 // this driver has always had.
 var fieldForOption = map[string]string{
-	"discovery":                  "Discovery",
-	"username":                   "Username",
-	"password":                   "Password",
-	"security-policy":            "SecurityPolicy",
-	"message-security":           "MessageSecurity",
-	"tls.keystore":               "KeyStoreFile",
-	"tls.keystore-password":      "KeyStorePassword",
-	"generated-key-size":         "GeneratedKeySize",
-	"server-certificate-file":    "ServerCertificateFile",
-	"tls.trust-store":            "TrustStore",
-	"tls.verify":                 "VerifyServerCertificate",
-	"allow-insecure-credentials": "AllowInsecureCredentials",
+	"discovery":                      "Discovery",
+	"username":                       "Username",
+	"password":                       "Password",
+	"security-policy":                "SecurityPolicy",
+	"message-security":               "MessageSecurity",
+	"tls.keystore":                   "KeyStoreFile",
+	"tls.keystore-password":          "KeyStorePassword",
+	"generated-key-size":             "GeneratedKeySize",
+	"server-certificate-file":        "ServerCertificateFile",
+	"tls.trust-store":                "TrustStore",
+	"tls.verify":                     "VerifyServerCertificate",
+	"allow-insecure-credentials":     "AllowInsecureCredentials",
+	"browse-max-references-per-node": "BrowseMaxReferencesPerNode",
+	"browse-max-total-nodes":         "BrowseMaxTotalNodes",
+	"browse-max-depth":               "BrowseMaxDepth",
 	// No PLC4J counterpart: this binding keeps its certificate in a directory rather than
 	// taking a key store, so the name is this binding's own - in the shared spelling.
 	"cert-directory":                     "CertDirectory",
@@ -212,11 +220,14 @@ func (c *Configuration) messageSecurityMode() (readWriteModel.MessageSecurityMod
 
 func createDefaultConfiguration() Configuration {
 	return Configuration{
-		SecurityPolicy:          "None",
-		MessageSecurity:         "SIGN_ENCRYPT",
-		GeneratedKeySize:        2048,
-		VerifyServerCertificate: true,
-		Discovery:               true,
+		SecurityPolicy:             "None",
+		MessageSecurity:            "SIGN_ENCRYPT",
+		GeneratedKeySize:           2048,
+		VerifyServerCertificate:    true,
+		Discovery:                  true,
+		BrowseMaxReferencesPerNode: 65536,
+		BrowseMaxTotalNodes:        1000000,
+		BrowseMaxDepth:             64,
 	}
 }
 

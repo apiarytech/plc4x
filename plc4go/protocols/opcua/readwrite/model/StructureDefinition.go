@@ -240,7 +240,7 @@ func (b *_StructureDefinition) CreateStructureDefinitionBuilder() StructureDefin
 ///////////////////////
 
 func (m *_StructureDefinition) GetExtensionId() int32 {
-	return int32(101)
+	return int32(122)
 }
 
 ///////////////////////

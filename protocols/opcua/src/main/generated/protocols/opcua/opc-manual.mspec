@@ -437,12 +437,12 @@
         ['15489' StructureDescription
             [simple NodeId dataTypeId]
             [simple QualifiedName name]
-            [simple StructureDefinition('101') structureDefinition]
+            [simple StructureDefinition('122') structureDefinition]
         ]
         ['15490' EnumDescription
             [simple NodeId dataTypeId]
             [simple QualifiedName name]
-            [simple EnumDefinition('102') enumDefinition]
+            [simple EnumDefinition('123') enumDefinition]
             [simple uint 8 builtInType]
         ]
         ['15007' SimpleTypeDescription
@@ -1163,14 +1163,14 @@
             [simple bit isOptional]
             
         ]
-        ['101' StructureDefinition
+        ['122' StructureDefinition
             [simple NodeId defaultEncodingId]
             [simple NodeId baseDataType]
             [simple StructureType structureType]
             [implicit int 32 noOfFields 'fields == null ? -1 : COUNT(fields)']
             [array StructureField('103') fields count 'noOfFields']
         ]
-        ['102' EnumDefinition
+        ['123' EnumDefinition
             [implicit int 32 noOfFields 'fields == null ? -1 : COUNT(fields)']
             [array EnumField('104') fields count 'noOfFields']
         ]

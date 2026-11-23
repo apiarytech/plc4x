@@ -18,8 +18,12 @@ Notes:
   end for lack of a fast enough port. The image patches p-net to treat an unknown medium as
   100BASE-TX full duplex. Nothing else is changed.
 - Build with `--build-arg LOG_LEVEL=DEBUG` to see p-net's state machines.
-- The sample device reports only its head module (slot 0) before a controller connects, so the
-  test establishes the application relation and the cyclic exchange without process data.
+- The sample device reports only its head module (slot 0) before a controller connects and plugs
+  what the controller expects. The test puts the echo module (`IDM_40`) in slot 1 with the
+  connection option `module.1=IDM_40`, writes a REAL and a UDINT to its outputs and reads them
+  back from its inputs, times the gain parameter (GSDML default 2, p-net's own default 1, so the
+  doubling also shows the parameter record write took effect). `PROFINET_TEST_ECHO_SLOT=` (empty)
+  skips that part.
 - The same test runs against a Raspberry Pi with p-net or any real device: set
   `PROFINET_TEST_INTERFACE`, `PROFINET_TEST_DEVICE` (name of station) and `PROFINET_TEST_GSD`
   (a directory holding its GSDML).

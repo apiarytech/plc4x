@@ -21,6 +21,7 @@ mkdir -p /tmp/pnet
 sleep 3
 status=0
 PROFINET_TEST_INTERFACE=veth0 PROFINET_TEST_DEVICE=rt-labs-dev PROFINET_TEST_GSD=/gsd \
+  PROFINET_TEST_ECHO_SLOT=${PROFINET_TEST_ECHO_SLOT-1} \
   go test -timeout 120s -count=1 -v -run TestConnectToDevice ./internal/profinet/ || status=$?
 echo "---- p-net log"
 grep -v '^\s*$' /tmp/pnet.log | tail -40

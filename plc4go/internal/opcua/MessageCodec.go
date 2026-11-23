@@ -91,6 +91,9 @@ func (m *MessageCodec) Send(ctx context.Context, interactionInfo string, message
 	return nil
 }
 
+// Receive returns the next chunk from the server, or nil while there is none yet. An Error
+// message and a lost connection are fatal transport errors: the default codec then fails every
+// waiting request with the cause, closes the transport and invalidates the connection.
 func (m *MessageCodec) Receive(ctx context.Context) (spi.Message, error) {
 	m.log.Trace().Msg("Receive")
 	ti := m.GetTransportInstance()
@@ -113,6 +116,11 @@ func (m *MessageCodec) Receive(ctx context.Context) (spi.Message, error) {
 
 	data, err := ti.PeekReadableBytes(ctx, 8)
 	if err != nil {
+		// A closed socket answers every further read with the same error. The read poll's
+		// timeout, on the other hand, only means the server has nothing to say yet.
+		if ti.ClassifyError(err) == transports.TransportErrorFatal {
+			return nil, transports.NewTransportError(transports.TransportErrorFatal, errors.Wrap(err, "connection lost"))
+		}
 		m.log.Debug().Err(err).Msg("error peeking")
 		return nil, nil
 	}
@@ -134,5 +142,10 @@ func (m *MessageCodec) Receive(ctx context.Context) (spi.Message, error) {
 		return nil, errors.New("Could not parse pdu")
 	}
 	m.log.Debug().Interface("opcuaAPU", opcuaAPU).Msg("got message")
+	// An Error message answers no request in particular: it ends the connection (OPC UA Part 6,
+	// 7.1.5), so it must not be left to the expectations of the single requests.
+	if serverErr, ok := opcuaAPU.GetMessage().(readWriteModel.OpcuaMessageError); ok {
+		return nil, transports.NewTransportError(transports.TransportErrorFatal, serverError(serverErr))
+	}
 	return opcuaAPU, nil
 }

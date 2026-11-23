@@ -214,6 +214,11 @@ func (h *SubscriptionHandle) publishLoop() {
 			return
 		}
 		if err != nil {
+			if !h.connection.messageCodec.IsRunning() {
+				h.log.Warn().Err(err).Msg("subscription ended with the connection")
+				h.plcSubscriber.subscriptionEnded(h)
+				return
+			}
 			h.mutex.Lock()
 			h.acks = append(acks, h.acks...) // acknowledge them with the next request
 			h.mutex.Unlock()

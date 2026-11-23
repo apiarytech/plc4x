@@ -51,6 +51,8 @@ type testServer struct {
 	mode      readWriteModel.MessageSecurityMode
 	// chunkBody is the largest body of a chunk the server sends; it splits larger responses.
 	chunkBody int
+	// refusal, when set, is what the server answers every service request with.
+	refusal []byte
 	// advertised is the security policy and mode of the endpoint the server lists; by default
 	// its own.
 	advertisedPolicy *securityPolicy
@@ -191,6 +193,10 @@ func (s *testServer) handle(chunk []byte) error {
 		s.mutex.Unlock()
 		return nil
 	case "MSG":
+		if s.refusal != nil {
+			s.transport.FillReadBuffer(s.refusal)
+			return nil
+		}
 		opened, err := s.security.openSymmetric(chunk)
 		if err != nil {
 			return err

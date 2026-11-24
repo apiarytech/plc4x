@@ -1,7 +1,8 @@
 # p-net test peer
 
 A Docker image with the open-source [p-net](https://github.com/rtlabs-com/p-net) Profinet device
-stack's sample application, used as the device in `internal/profinet`'s `TestConnectToDevice`.
+stack's sample application, used as the device in `internal/profinet`'s `TestConnectToDevice` and
+`TestDeviceAlarms`.
 p-net is GPL v3; it is fetched and built inside the image and only talks to plc4go over a veth
 pair, so nothing from it is linked into plc4go.
 
@@ -27,3 +28,12 @@ Notes:
 - The same test runs against a Raspberry Pi with p-net or any real device: set
   `PROFINET_TEST_INTERFACE`, `PROFINET_TEST_DEVICE` (name of station) and `PROFINET_TEST_GSD`
   (a directory holding its GSDML).
+- `TestDeviceAlarms` presses the sample device's button 2, a file the script hands it with
+  `pn_dev -d`, to make it raise alarms from the 8-bit input module (`IDM_30`) it puts in slot 2: a
+  process alarm (high priority), then, after two presses that switch the cyclic data to backup
+  and back, a channel diagnosis (low priority). The test checks each alarm reaches an `ALARM:2`
+  subscription and that the device acknowledges the driver's AlarmAck. On a Pi, set
+  `PROFINET_TEST_ALARM_BUTTON` to the file given to `pn_dev -d`.
+- `PNET_ARGS` adds arguments to `pn_dev`, e.g. `-e PNET_ARGS=-vvv` for the sample application's
+  own log. Its output to a file is block buffered, so lines can be missing when the container
+  stops; run it under `stdbuf -oL` to see everything.

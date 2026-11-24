@@ -17,12 +17,15 @@ ip netns exec dev ip link set lo up
 ip netns exec dev ip addr add 192.168.10.2/24 dev veth1
 ip netns exec dev ip link set veth1 up
 mkdir -p /tmp/pnet
-(cd /tmp/pnet && ip netns exec dev pn_dev -i veth1 -p /tmp/pnet > /tmp/pnet.log 2>&1 &)
+# The sample device's button 2 (-d) is a file; TestDeviceAlarms presses it to make the device raise
+# alarms.
+echo 0 > /tmp/pnet/button2
+(cd /tmp/pnet && ip netns exec dev pn_dev -i veth1 -p /tmp/pnet -d /tmp/pnet/button2 ${PNET_ARGS} > /tmp/pnet.log 2>&1 &)
 sleep 3
 status=0
 PROFINET_TEST_INTERFACE=veth0 PROFINET_TEST_DEVICE=rt-labs-dev PROFINET_TEST_GSD=/gsd \
-  PROFINET_TEST_ECHO_SLOT=${PROFINET_TEST_ECHO_SLOT-1} \
-  go test -timeout 120s -count=1 -v -run TestConnectToDevice ./internal/profinet/ || status=$?
+  PROFINET_TEST_ECHO_SLOT=${PROFINET_TEST_ECHO_SLOT-1} PROFINET_TEST_ALARM_BUTTON=/tmp/pnet/button2 \
+  go test -timeout 180s -count=1 -v -run 'TestConnectToDevice|TestDeviceAlarms' ./internal/profinet/ || status=$?
 echo "---- p-net log"
 grep -v '^\s*$' /tmp/pnet.log | tail -40
 exit $status

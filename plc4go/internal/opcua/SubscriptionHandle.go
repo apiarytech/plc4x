@@ -21,10 +21,7 @@ package opcua
 
 import (
 	"context"
-	"encoding/binary"
-	"slices"
 	"sync"
-	"sync/atomic"
 	"time"
 
 	"github.com/rs/zerolog"
@@ -33,412 +30,285 @@ import (
 	readWriteModel "github.com/apache/plc4x/plc4go/protocols/opcua/readwrite/model"
 	"github.com/apache/plc4x/plc4go/spi/errors"
 	spiModel "github.com/apache/plc4x/plc4go/spi/model"
-	"github.com/apache/plc4x/plc4go/spi/utils"
 )
 
+// Timing of a subscription (OPC UA Part 4, 5.13.2): the server answers a Publish request at
+// least every keep-alive count publishing intervals, and drops the subscription after the
+// lifetime count without one.
+const (
+	SUBSCRIPTION_KEEP_ALIVE_COUNT = 10
+	SUBSCRIPTION_LIFETIME_COUNT   = 60
+	SUBSCRIPTION_DEFAULT_INTERVAL = time.Second
+	// PUBLISH_REQUESTS is how many Publish requests wait at the server, so a notification goes
+	// out while the answer to the previous one is on its way.
+	PUBLISH_REQUESTS = 2
+)
+
+// SubscriptionHandle is one OPC UA subscription with a monitored item per tag. It keeps
+// Publish requests waiting at the server and hands the data changes they bring to the
+// consumers registered on it.
 type SubscriptionHandle struct {
 	*spiModel.DefaultPlcSubscriptionHandle
 	plcSubscriber       *Subscriber
 	connection          *Connection
 	subscriptionRequest apiModel.PlcSubscriptionRequest
 	tagNames            []string
-	consumers           []apiModel.PlcSubscriptionEventConsumer
 	subscriptionId      uint32
 	cycleTime           time.Duration
 	revisedCycleTime    time.Duration
-	clientHandles       atomic.Uint32
+	keepAliveCount      uint32
 
-	destroy      atomic.Bool
+	mutex         sync.Mutex
+	clientHandles map[uint32]string // the tag of each monitored item's client handle
+	results       map[string]apiModel.PlcResponseCode
+	acks          []readWriteModel.SubscriptionAcknowledgement
+
+	ctx          context.Context
+	cancel       context.CancelFunc
+	stopOnce     sync.Once
 	subscriberWg sync.WaitGroup
-	complete     bool
-
-	wg sync.WaitGroup // use to track spawned go routines
 
 	log zerolog.Logger
 }
 
-func NewSubscriptionHandle(log zerolog.Logger, subscriber *Subscriber, connection *Connection, subscriptionRequest apiModel.PlcSubscriptionRequest, subscriptionId uint32, cycleTime time.Duration) *SubscriptionHandle {
-	s := &SubscriptionHandle{
+// NewSubscriptionHandle makes the handle of subscription subscriptionId and creates its
+// monitored items.
+func NewSubscriptionHandle(log zerolog.Logger, subscriber *Subscriber, connection *Connection, subscriptionRequest apiModel.PlcSubscriptionRequest, subscriptionId uint32, cycleTime, revisedCycleTime time.Duration, keepAliveCount uint32) (*SubscriptionHandle, error) {
+	ctx, cancel := context.WithCancel(context.Background())
+	h := &SubscriptionHandle{
 		plcSubscriber:       subscriber,
 		connection:          connection,
 		subscriptionRequest: subscriptionRequest,
 		tagNames:            subscriptionRequest.GetTagNames(),
 		subscriptionId:      subscriptionId,
 		cycleTime:           cycleTime,
+		revisedCycleTime:    revisedCycleTime,
+		keepAliveCount:      keepAliveCount,
+		clientHandles:       map[uint32]string{},
+		results:             map[string]apiModel.PlcResponseCode{},
+		ctx:                 ctx,
+		cancel:              cancel,
 		log:                 log,
 	}
-	s.clientHandles.Store(1)
-	s.DefaultPlcSubscriptionHandle = spiModel.NewDefaultPlcSubscriptionHandleWithHandleToRegister(subscriber, s)
-	_, err := s.onSubscribeCreateMonitoredItemsRequest()
+	h.DefaultPlcSubscriptionHandle = spiModel.NewDefaultPlcSubscriptionHandleWithHandleToRegister(subscriber, h)
+	if err := h.createMonitoredItems(); err != nil {
+		cancel()
+		return nil, err
+	}
+	return h, nil
+}
+
+// interval is a tag's sampling interval: the request's, the subscription's otherwise.
+func (h *SubscriptionHandle) interval(name string) time.Duration {
+	if request, ok := h.subscriptionRequest.(interface{ GetInterval(string) time.Duration }); ok {
+		if interval := request.GetInterval(name); interval > 0 {
+			return interval
+		}
+	}
+	if h.subscriptionType(name) == apiModel.SubscriptionCyclic {
+		return h.cycleTime
+	}
+	return 0 // as fast as the server samples
+}
+
+func (h *SubscriptionHandle) subscriptionType(name string) apiModel.PlcSubscriptionType {
+	if request, ok := h.subscriptionRequest.(interface {
+		GetType(string) apiModel.PlcSubscriptionType
+	}); ok {
+		if t := request.GetType(name); t != 0 {
+			return t
+		}
+	}
+	return apiModel.SubscriptionChangeOfState
+}
+
+// createMonitoredItems creates a monitored item, reporting data changes of Value, per tag.
+func (h *SubscriptionHandle) createMonitoredItems() error {
+	channel := h.connection.channel
+	requests := make([]readWriteModel.MonitoredItemCreateRequest, 0, len(h.tagNames))
+	handles := make([]uint32, 0, len(h.tagNames))
+	for i, name := range h.tagNames {
+		tag, ok := h.subscriptionRequest.GetTag(name).(Tag)
+		if !ok {
+			return errors.Errorf("tag %s is not an OPC UA tag", name)
+		}
+		nodeId, err := generateNodeId(tag)
+		if err != nil {
+			return errors.Wrapf(err, "tag %s", name)
+		}
+		clientHandle := uint32(i + 1)
+		h.clientHandles[clientHandle] = name
+		handles = append(handles, clientHandle)
+		requests = append(requests, readWriteModel.NewMonitoredItemCreateRequest(
+			readWriteModel.NewReadValueId(nodeId, 0xD, NULL_STRING, readWriteModel.NewQualifiedName(0, NULL_STRING)),
+			// Cyclic tags report too: Sampling would collect values without ever sending them.
+			readWriteModel.MonitoringMode_monitoringModeReporting,
+			readWriteModel.NewMonitoringParameters(clientHandle, float64(h.interval(name))/float64(time.Millisecond),
+				NULL_EXTENSION_OBJECT, 1, true),
+		))
+	}
+	ctx, cancel := context.WithTimeout(h.ctx, REQUEST_TIMEOUT_LONG*time.Millisecond)
+	defer cancel()
+	response, err := channel.call(ctx, h.connection.messageCodec, readWriteModel.NewCreateMonitoredItemsRequest(
+		channel.newRequestHeader(channel.getRequestHandle()), h.subscriptionId,
+		readWriteModel.TimestampsToReturn_timestampsToReturnBoth, requests))
 	if err != nil {
-		subscriber.onDisconnect()
+		return errors.Wrap(err, "CreateMonitoredItems failed")
 	}
-	s.startSubscriber()
-	return s
+	created, ok := response.(readWriteModel.CreateMonitoredItemsResponse)
+	if !ok {
+		return errors.Errorf("unexpected response %T to CreateMonitoredItems", response)
+	}
+	results := created.GetResults()
+	for i, handle := range handles {
+		name := h.clientHandles[handle]
+		code := apiModel.PlcResponseCode_INTERNAL_ERROR
+		if i < len(results) {
+			code = responseCodeOf(results[i].GetStatusCode().GetStatusCode())
+		}
+		h.results[name] = code
+		if code != apiModel.PlcResponseCode_OK {
+			h.log.Warn().Str("tag", name).Stringer("code", code).Msg("tag left out of the subscription")
+		}
+	}
+	return nil
 }
 
-func (h *SubscriptionHandle) onSubscribeCreateMonitoredItemsRequest() (readWriteModel.CreateMonitoredItemsResponse, error) {
-	ctx := context.TODO()
-	requestList := make([]readWriteModel.MonitoredItemCreateRequest, len(h.tagNames))
-
-	for _, tagName := range h.tagNames {
-		tagDefaultPlcSubscription := h.subscriptionRequest.GetTag(tagName)
-
-		idNode, err := generateNodeId(tagDefaultPlcSubscription.(Tag))
-		if err != nil {
-			return nil, errors.Wrap(err, "error genertating node id")
-		}
-
-		readValueId := readWriteModel.NewReadValueId(
-			idNode,
-			0xD,
-			NULL_STRING,
-			readWriteModel.NewQualifiedName(0, NULL_STRING))
-
-		var monitoringMode readWriteModel.MonitoringMode
-		switch tagDefaultPlcSubscription.GetPlcSubscriptionType() {
-		case apiModel.SubscriptionCyclic:
-			monitoringMode = readWriteModel.MonitoringMode_monitoringModeSampling
-		case apiModel.SubscriptionChangeOfState:
-			monitoringMode = readWriteModel.MonitoringMode_monitoringModeReporting
-		case apiModel.SubscriptionEvent:
-			monitoringMode = readWriteModel.MonitoringMode_monitoringModeReporting
-		default:
-			monitoringMode = readWriteModel.MonitoringMode_monitoringModeReporting
-		}
-
-		clientHandle := h.clientHandles.Add(1) - 1
-
-		parameters := readWriteModel.NewMonitoringParameters(
-			clientHandle,
-			float64(h.cycleTime),  // sampling interval
-			NULL_EXTENSION_OBJECT, // filter, null means use default
-			1,                     // queue size
-			true,                  // discard oldest
-		)
-
-		request := readWriteModel.NewMonitoredItemCreateRequest(
-			readValueId, monitoringMode, parameters)
-
-		requestList = append(requestList, request)
+// responseCodes are the codes of the tags: OK for those the subscription monitors.
+func (h *SubscriptionHandle) responseCodes() map[string]apiModel.PlcResponseCode {
+	h.mutex.Lock()
+	defer h.mutex.Unlock()
+	codes := make(map[string]apiModel.PlcResponseCode, len(h.results))
+	for name, code := range h.results {
+		codes[name] = code
 	}
-
-	requestHeader := readWriteModel.NewRequestHeader(h.connection.channel.getAuthenticationToken(),
-		h.connection.channel.getCurrentDateTime(),
-		h.connection.channel.getRequestHandle(),
-		0,
-		NULL_STRING,
-		REQUEST_TIMEOUT_LONG,
-		NULL_EXTENSION_OBJECT)
-
-	createMonitoredItemsRequest := readWriteModel.NewCreateMonitoredItemsRequest(
-		requestHeader,
-		h.subscriptionId,
-		readWriteModel.TimestampsToReturn_timestampsToReturnBoth,
-		requestList,
-	)
-
-	identifier := createMonitoredItemsRequest.GetExtensionId()
-	expandedNodeId := readWriteModel.NewExpandedNodeId(false, //Namespace Uri Specified
-		false, //Server Index Specified
-		readWriteModel.NewNodeIdFourByte(0, uint16(identifier)),
-		nil,
-		nil)
-
-	extObject := readWriteModel.NewRootExtensionObject(
-		expandedNodeId,
-		createMonitoredItemsRequest,
-	)
-
-	buffer := utils.NewWriteBufferByteBased(utils.WithByteOrderForByteBasedBuffer(binary.LittleEndian))
-	if err := extObject.SerializeWithWriteBuffer(ctx, buffer); err != nil {
-		return nil, errors.Wrapf(err, "Unable to serialise the ReadRequest")
-	}
-
-	responseChan := make(chan readWriteModel.CreateMonitoredItemsResponse, 100) // TODO: bit oversized to not block anything. Discards errors
-	errorChan := make(chan error, 100)                                          // TODO: bit oversized to not block anything. Discards errors
-	consumer := func(opcuaResponse []byte) {
-		unknownExtensionObject, err := readWriteModel.ExtensionObjectParseWithBuffer[readWriteModel.ExtensionObject](ctx, utils.NewReadBufferByteBased(opcuaResponse, utils.WithByteOrderForReadBufferByteBased(binary.LittleEndian)), false)
-		if err != nil {
-			errorChan <- errors.Wrapf(err, "Unable to read the reply")
-			return
-		}
-		var responseMessage readWriteModel.CreateMonitoredItemsResponse
-		switch unknownExtensionObject := unknownExtensionObject.(type) {
-		case readWriteModel.CreateMonitoredItemsResponse:
-			responseMessage = unknownExtensionObject
-		case readWriteModel.ServiceFault:
-			serviceFault := unknownExtensionObject
-			header := serviceFault.GetResponseHeader().(readWriteModel.ResponseHeader)
-			errorChan <- errors.Errorf("Subscription ServiceFault returned from server with error code,  '%s'", header.GetServiceResult())
-			h.plcSubscriber.onDisconnect()
-			return
-		default:
-			errorChan <- errors.Errorf("Unexpected type %T received", unknownExtensionObject)
-			h.plcSubscriber.onDisconnect()
-			return
-		}
-
-		array := make([]readWriteModel.MonitoredItemCreateResult, len(responseMessage.GetResults()))
-		for i, definition := range responseMessage.GetResults() {
-			array[i] = definition.(readWriteModel.MonitoredItemCreateResult)
-		}
-		for index, arrayLength := 0, len(array); index < arrayLength; index++ {
-			result := array[index]
-			if code, ok := readWriteModel.OpcuaStatusCodeByValue(result.GetStatusCode().GetStatusCode()); !ok || code != readWriteModel.OpcuaStatusCode_Good {
-				h.log.Error().Str("tag", h.tagNames[index]).Msg("Invalid Tag, subscription created without this tag")
-			} else {
-				h.log.Debug().Str("tag", h.tagNames[index]).Msg("Tag was added to the subscription")
-			}
-		}
-		responseChan <- responseMessage
-	}
-
-	errorDispatcher := func(err error) {
-		errorChan <- errors.Wrap(err, "error received")
-	}
-
-	h.connection.channel.submit(ctx, h.connection.messageCodec, errorDispatcher, consumer, buffer)
-
-	select {
-	case response := <-responseChan:
-		return response, nil
-	case err := <-errorChan:
-		return nil, errors.Wrap(err, "error received")
-	case <-ctx.Done():
-		return nil, errors.Wrap(ctx.Err(), "context ended")
-	}
+	return codes
 }
 
-/**
- * startSubscriber Main subscriber loop. For subscription, we still need to send a request the server on every cycle.
- * Which includes a request for an update of the previously agreed upon list of tags.
- * The server will respond at most once every cycle.
- */
+// startSubscriber starts the Publish loops.
 func (h *SubscriptionHandle) startSubscriber() {
-	h.log.Trace().Msg("Starting Subscription")
-
-	h.subscriberWg.Go(func() {
-
-		var outstandingAcknowledgements []readWriteModel.SubscriptionAcknowledgement
-		var outstandingRequests []uint32
-		for !h.destroy.Load() {
-
-			requestHandle := h.connection.channel.getRequestHandle()
-
-			//If we are waiting on a response and haven't received one, just wait until we do. A keep alive will be sent out eventually
-			if len(outstandingRequests) <= 1 {
-				requestHeader := readWriteModel.NewRequestHeader(h.connection.channel.getAuthenticationToken(),
-					h.connection.channel.getCurrentDateTime(),
-					requestHandle,
-					0,
-					NULL_STRING,
-					uint32(h.revisedCycleTime*10),
-					NULL_EXTENSION_OBJECT)
-
-				//Make a copy of the outstanding requests, so it isn't modified while we are putting the ack list together.
-				acks := slices.Clone(outstandingAcknowledgements)
-				ackLength := len(acks)
-				if ackLength == 0 {
-					ackLength = -1
-				}
-				{ // golang version of remove all
-					tmpOutstandingAcknowledgements := map[readWriteModel.SubscriptionAcknowledgement]bool{}
-					for _, acknowledgement := range outstandingAcknowledgements {
-						tmpOutstandingAcknowledgements[acknowledgement] = true
-					}
-					for _, ack := range acks {
-						delete(tmpOutstandingAcknowledgements, ack)
-					}
-					outstandingAcknowledgements = make([]readWriteModel.SubscriptionAcknowledgement, len(tmpOutstandingAcknowledgements))
-					count := 0
-					for ack := range tmpOutstandingAcknowledgements {
-						outstandingAcknowledgements[count] = ack
-						count++
-					}
-				}
-
-				publishRequest := readWriteModel.NewPublishRequest(
-					requestHeader,
-					acks,
-				)
-
-				identifier := publishRequest.GetExtensionId()
-				extExpandedNodeId := readWriteModel.NewExpandedNodeId(false, //Namespace Uri Specified
-					false, //Server Index Specified
-					readWriteModel.NewNodeIdFourByte(0, uint16(identifier)),
-					nil,
-					nil)
-
-				extObject := readWriteModel.NewRootExtensionObject(
-					extExpandedNodeId,
-					publishRequest,
-				)
-
-				ctx := context.Background()
-
-				buffer := utils.NewWriteBufferByteBased(utils.WithByteOrderForByteBasedBuffer(binary.LittleEndian))
-				if err := extObject.SerializeWithWriteBuffer(ctx, buffer); err != nil {
-					h.log.Error().Err(err).Msg("Unable to serialise the ReadRequest")
-					continue
-				}
-
-				consumer := func(opcuaResponse []byte) {
-					var responseMessage readWriteModel.PublishResponse
-					var serviceFault readWriteModel.ServiceFault
-					unknownExtensionObject, err := readWriteModel.ExtensionObjectParseWithBuffer[readWriteModel.ExtensionObject](ctx, utils.NewReadBufferByteBased(opcuaResponse, utils.WithByteOrderForReadBufferByteBased(binary.LittleEndian)), false)
-					if err != nil {
-						h.log.Error().Err(err).Msg("Unable to parse the returned Subscription response")
-						h.plcSubscriber.onDisconnect()
-						return
-					}
-					switch unknownExtensionObject := unknownExtensionObject.(type) {
-					case readWriteModel.PublishResponse:
-						responseMessage = unknownExtensionObject
-					case readWriteModel.ServiceFault:
-						serviceFault = unknownExtensionObject
-						header := serviceFault.GetResponseHeader().(readWriteModel.ResponseHeader)
-						h.log.Debug().
-							Stringer("serviceResult", header.GetServiceResult()).
-							Msg("Subscription ServiceFault returned from server with error code, ignoring as it is probably just a result of a Delete Subscription Request")
-						//h.plcSubscriber.onDisconnect(context);
-						return
-					}
-					if serviceFault == nil {
-						handle := responseMessage.GetResponseHeader().(readWriteModel.ResponseHeader).GetRequestHandle()
-						index := 0
-						for i, request := range outstandingRequests {
-							if request == handle {
-								index = i
-							}
-						}
-						outstandingRequests = append(outstandingRequests[:index], outstandingRequests[index+1:]...)
-
-						for _, availableSequenceNumber := range responseMessage.GetAvailableSequenceNumbers() {
-							outstandingAcknowledgements = append(outstandingAcknowledgements, readWriteModel.NewSubscriptionAcknowledgement(h.subscriptionId, availableSequenceNumber))
-						}
-
-						for _, notificationMessage := range responseMessage.GetNotificationMessage().(readWriteModel.NotificationMessage).GetNotificationData() {
-							notification := notificationMessage.GetBody()
-							if notification, ok := notification.(readWriteModel.DataChangeNotification); ok {
-								h.log.Trace().Msg("Found a Data Change notification")
-								items := notification.GetMonitoredItems()
-								monitoredNoticiations := make([]readWriteModel.MonitoredItemNotification, len(items))
-								for i, item := range items {
-									monitoredNoticiations[i] = item.(readWriteModel.MonitoredItemNotification)
-								}
-								h.onSubscriptionValue(monitoredNoticiations)
-							} else {
-								h.log.Warn().Msg("Unsupported Notification type")
-							}
-						}
-					}
-				}
-
-				errorDispatcher := func(err error) {
-					h.log.Error().Err(err).Msg("error received")
-					h.plcSubscriber.onDisconnect()
-				}
-
-				h.connection.channel.submit(ctx, h.connection.messageCodec, errorDispatcher, consumer, buffer)
-			}
-			//Put the subscriber loop to sleep for the rest of the cycle.
-			time.Sleep(h.revisedCycleTime)
-		}
-		//Wait for any outstanding responses to arrive, using the request timeout length
-		//sleep(this.revisedCycleTime * 10);
-		h.complete = true
-	})
+	for range PUBLISH_REQUESTS {
+		h.subscriberWg.Go(h.publishLoop)
+	}
 }
 
-// stopSubscriber stops the subscriber either on disconnect or on error
-func (h *SubscriptionHandle) stopSubscriber() {
-	ctx := context.TODO()
-	h.destroy.Store(true)
-
-	requestHandle := h.connection.channel.getRequestHandle()
-
-	requestHeader := readWriteModel.NewRequestHeader(
-		h.connection.channel.getAuthenticationToken(),
-		h.connection.channel.getCurrentDateTime(),
-		requestHandle,
-		0,
-		NULL_STRING,
-		uint32(h.revisedCycleTime*10),
-		NULL_EXTENSION_OBJECT,
-	)
-
-	subscriptions := []uint32{h.subscriptionId}
-	deleteSubscriptionrequest := readWriteModel.NewDeleteSubscriptionsRequest(requestHeader,
-		subscriptions,
-	)
-
-	identifier := deleteSubscriptionrequest.GetExtensionId()
-	extExpandedNodeId := readWriteModel.NewExpandedNodeId(false, //Namespace Uri Specified
-		false, //Server Index Specified
-		readWriteModel.NewNodeIdFourByte(0, uint16(identifier)),
-		nil,
-		nil,
-	)
-
-	extObject := readWriteModel.NewRootExtensionObject(
-		extExpandedNodeId,
-		deleteSubscriptionrequest,
-	)
-
-	buffer := utils.NewWriteBufferByteBased(utils.WithByteOrderForByteBasedBuffer(binary.LittleEndian))
-	if err := extObject.SerializeWithWriteBuffer(ctx, buffer); err != nil {
-		h.log.Error().Err(err).Msg("Unable to serialise the ReadRequest")
-		return
-	}
-
-	consumer := func(opcuaResponse []byte) {
-		var responseMessage readWriteModel.DeleteSubscriptionsResponse
-		unknownExtensionObject, err := readWriteModel.ExtensionObjectParseWithBuffer[readWriteModel.ExtensionObject](ctx, utils.NewReadBufferByteBased(opcuaResponse, utils.WithByteOrderForReadBufferByteBased(binary.LittleEndian)), false)
+// publishLoop sends a Publish request, waits for its answer, delivers it and sends the next,
+// until the subscription stops.
+func (h *SubscriptionHandle) publishLoop() {
+	channel := h.connection.channel
+	// The server answers at the latest after keepAliveCount intervals; past twice that and a
+	// margin the request is lost.
+	wait := 2*time.Duration(h.keepAliveCount)*h.revisedCycleTime + REQUEST_TIMEOUT_LONG*time.Millisecond
+	failures := 0
+	for h.ctx.Err() == nil {
+		h.mutex.Lock()
+		acks := h.acks
+		h.acks = nil
+		h.mutex.Unlock()
+		header := readWriteModel.NewRequestHeader(channel.getAuthenticationToken(), channel.getCurrentDateTime(),
+			channel.getRequestHandle(), 0, NULL_STRING, uint32(wait/time.Millisecond), NULL_EXTENSION_OBJECT)
+		ctx, cancel := context.WithTimeout(h.ctx, wait)
+		response, err := channel.call(ctx, h.connection.messageCodec, readWriteModel.NewPublishRequest(header, acks))
+		cancel()
+		if h.ctx.Err() != nil {
+			return
+		}
 		if err != nil {
-			h.log.Error().Err(err).Msg("Unable to parse the returned Subscription response")
-			h.plcSubscriber.onDisconnect()
-			return
+			if !h.connection.messageCodec.IsRunning() {
+				h.log.Warn().Err(err).Msg("subscription ended with the connection")
+				h.plcSubscriber.subscriptionEnded(h)
+				return
+			}
+			h.mutex.Lock()
+			h.acks = append(acks, h.acks...) // acknowledge them with the next request
+			h.mutex.Unlock()
+			if status := faultStatus(err); status != 0 {
+				switch status {
+				case uint32(readWriteModel.OpcuaStatusCode_BadNoSubscription), uint32(readWriteModel.OpcuaStatusCode_BadSessionIdInvalid),
+					uint32(readWriteModel.OpcuaStatusCode_BadSessionClosed), uint32(readWriteModel.OpcuaStatusCode_BadSubscriptionIdInvalid):
+					h.log.Warn().Err(err).Msg("subscription ended by the server")
+					h.plcSubscriber.subscriptionEnded(h)
+					return
+				case uint32(readWriteModel.OpcuaStatusCode_BadTooManyPublishRequests):
+					// The server keeps fewer requests waiting: this loop waits a cycle.
+				}
+			}
+			failures++
+			h.log.Debug().Err(err).Int("failures", failures).Msg("Publish failed")
+			select {
+			case <-h.ctx.Done():
+				return
+			case <-time.After(min(time.Duration(failures)*h.revisedCycleTime, 10*time.Second)):
+			}
+			continue
 		}
-		switch unknownExtensionObject := unknownExtensionObject.(type) {
-		case readWriteModel.DeleteSubscriptionsResponse:
-			responseMessage = unknownExtensionObject
-		case readWriteModel.ServiceFault:
-			serviceFault := unknownExtensionObject
-			header := serviceFault.GetResponseHeader().(readWriteModel.ResponseHeader)
-			h.log.Debug().
-				Stringer("serviceResult", header.GetServiceResult()).
-				Msg("Subscription ServiceFault returned from server with error code, ignoring as it is probably just a result of a Delete Subscription Request")
-			return
+		failures = 0
+		published, ok := response.(readWriteModel.PublishResponse)
+		if !ok {
+			h.log.Warn().Type("response", response).Msg("unexpected response to Publish")
+			continue
 		}
-		h.log.Debug().Interface("responseMessage", responseMessage).Msg("Received response")
+		h.onPublish(published)
 	}
-
-	errorDispatcher := func(err error) {
-		h.log.Error().Err(err).Msg("error received")
-		h.plcSubscriber.onDisconnect()
-	}
-
-	h.connection.channel.submit(ctx, h.connection.messageCodec, errorDispatcher, consumer, buffer)
 }
 
-/**
- * onSubscriptionValue Receive the returned values from the OPCUA server and format it so that it can be received by the PLC4X client.
- *
- * @param values - array of data values to be sent to the client.
- */
-func (h *SubscriptionHandle) onSubscriptionValue(values []readWriteModel.MonitoredItemNotification) {
-	var tagNameList []string
-	var dataValues []readWriteModel.DataValue
-	for _, value := range values {
-		tagNameList = append(tagNameList, h.tagNames[value.GetClientHandle()-1])
-		dataValues = append(dataValues, value.GetValue())
+// onPublish acknowledges a notification message and delivers its data changes.
+func (h *SubscriptionHandle) onPublish(response readWriteModel.PublishResponse) {
+	message, ok := response.GetNotificationMessage().(readWriteModel.NotificationMessage)
+	if !ok || len(message.GetNotificationData()) == 0 {
+		return // a keep-alive
 	}
-	_, responseCodes, responseValues := readResponse(h.log, nil, tagNameList, dataValues)
-	// TODO: big oof. Where do we get all those nil values from?
-	event := spiModel.NewDefaultPlcSubscriptionEvent(nil, nil, nil, nil, responseCodes, responseValues)
+	h.mutex.Lock()
+	h.acks = append(h.acks, readWriteModel.NewSubscriptionAcknowledgement(response.GetSubscriptionId(), message.GetSequenceNumber()))
+	h.mutex.Unlock()
+	for _, data := range message.GetNotificationData() {
+		switch notification := data.GetBody().(type) {
+		case readWriteModel.DataChangeNotification:
+			h.onSubscriptionValue(notification.GetMonitoredItems())
+		case readWriteModel.StatusChangeNotification:
+			h.log.Warn().Stringer("status", notification.GetStatus()).Msg("subscription status changed")
+		default:
+			h.log.Debug().Type("notification", notification).Msg("notification type not handled")
+		}
+	}
+}
 
-	for _, consumer := range h.consumers {
-		consumer(event)
+// onSubscriptionValue hands data changes to the consumers, an event per change so a tag that
+// changed twice in one message reaches them twice, in order.
+func (h *SubscriptionHandle) onSubscriptionValue(values []readWriteModel.MonitoredItemNotification) {
+	for _, value := range values {
+		name, ok := h.clientHandles[value.GetClientHandle()]
+		if !ok {
+			h.log.Debug().Uint32("clientHandle", value.GetClientHandle()).Msg("notification for an unknown monitored item")
+			continue
+		}
+		_, responseCodes, responseValues := readResponse(h.log, nil, []string{name}, []readWriteModel.DataValue{value.GetValue()})
+		tag := h.subscriptionRequest.GetTag(name)
+		event := spiModel.NewDefaultPlcSubscriptionEvent(nil,
+			map[string]apiModel.PlcTag{name: tag},
+			map[string]apiModel.PlcSubscriptionType{name: h.subscriptionType(name)},
+			map[string]time.Duration{name: h.interval(name)},
+			responseCodes, responseValues)
+		for _, consumer := range h.plcSubscriber.consumersOf(h) {
+			consumer(event)
+		}
 	}
+}
+
+// stopSubscriber stops the Publish loops and deletes the subscription at the server.
+func (h *SubscriptionHandle) stopSubscriber() {
+	h.stopOnce.Do(func() {
+		h.cancel()
+		h.subscriberWg.Wait()
+		channel := h.connection.channel
+		if channel.authenticationToken == nil {
+			return
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), REQUEST_TIMEOUT_LONG*time.Millisecond)
+		defer cancel()
+		if _, err := channel.call(ctx, h.connection.messageCodec, readWriteModel.NewDeleteSubscriptionsRequest(
+			channel.newRequestHeader(channel.getRequestHandle()), []uint32{h.subscriptionId})); err != nil {
+			h.log.Debug().Err(err).Msg("DeleteSubscriptions failed")
+		}
+	})
 }

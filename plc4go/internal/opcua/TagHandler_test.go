@@ -27,6 +27,7 @@ import (
 	"github.com/stretchr/testify/assert"
 
 	"github.com/apache/plc4x/plc4go/pkg/api/model"
+	apiValues "github.com/apache/plc4x/plc4go/pkg/api/values"
 )
 
 func TestNewTagHandler(t *testing.T) {
@@ -197,5 +198,27 @@ func TestTagHandler_handleTagAddress(t *testing.T) {
 				t.Errorf("handleTagAddress() got = %v, want %v", got, tt.want)
 			}
 		})
+	}
+}
+
+func TestTagHandler_ParseTagKeepsTheDataType(t *testing.T) {
+	for address, want := range map[string]apiValues.PlcValueType{
+		"ns=2;i=10846;BOOL":          apiValues.BOOL,
+		"ns=1;s=Line1.Speed;LREAL":   apiValues.LREAL,
+		"ns=1;s=Line1.Setpoint;REAL": apiValues.REAL,
+	} {
+		tag, err := NewTagHandler().ParseTag(address)
+		if err != nil {
+			t.Fatalf("%s: %v", address, err)
+		}
+		if got := tag.GetValueType(); got != want {
+			t.Errorf("%s: value type %s, want %s", address, got, want)
+		}
+		if got := tag.GetAddressString(); got != address {
+			t.Errorf("%s: address %s", address, got)
+		}
+	}
+	if _, err := NewTagHandler().ParseTag("ns=1;s=X;JIBBERISH"); err == nil {
+		t.Error("an unknown data type was taken")
 	}
 }

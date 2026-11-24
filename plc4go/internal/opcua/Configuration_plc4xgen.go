@@ -73,32 +73,6 @@ func (d *Configuration) SerializeWithWriteBuffer(ctx context.Context, writeBuffe
 		return err
 	}
 
-	if err := writeBuffer.WriteBit("isEncrypted", d.IsEncrypted); err != nil {
-		return err
-	}
-
-	if d.Thumbprint != nil {
-		if serializableField, ok := any(d.Thumbprint).(utils.Serializable); ok {
-			if err := writeBuffer.PushContext("thumbprint"); err != nil {
-				return err
-			}
-			if err := serializableField.SerializeWithWriteBuffer(ctx, writeBuffer); err != nil {
-				return err
-			}
-			if err := writeBuffer.PopContext("thumbprint"); err != nil {
-				return err
-			}
-		} else {
-			stringValue := fmt.Sprintf("%v", d.Thumbprint)
-			if err := writeBuffer.WriteString("thumbprint", uint32(len(stringValue)*8), stringValue, utils.WithEncoding("UTF-8")); err != nil {
-				return err
-			}
-		}
-	}
-	if err := writeBuffer.WriteByteArray("senderCertificate", d.SenderCertificate); err != nil {
-		return err
-	}
-
 	if err := writeBuffer.WriteBit("discovery", d.Discovery); err != nil {
 		return err
 	}
@@ -115,11 +89,11 @@ func (d *Configuration) SerializeWithWriteBuffer(ctx context.Context, writeBuffe
 		return err
 	}
 
-	if err := writeBuffer.WriteString("keyStoreFile", uint32(len(d.KeyStoreFile)*8), d.KeyStoreFile, utils.WithEncoding("UTF-8")); err != nil {
+	if err := writeBuffer.WriteString("messageSecurity", uint32(len(d.MessageSecurity)*8), d.MessageSecurity, utils.WithEncoding("UTF-8")); err != nil {
 		return err
 	}
 
-	if err := writeBuffer.WriteString("certDirectory", uint32(len(d.CertDirectory)*8), d.CertDirectory, utils.WithEncoding("UTF-8")); err != nil {
+	if err := writeBuffer.WriteString("keyStoreFile", uint32(len(d.KeyStoreFile)*8), d.KeyStoreFile, utils.WithEncoding("UTF-8")); err != nil {
 		return err
 	}
 
@@ -127,7 +101,39 @@ func (d *Configuration) SerializeWithWriteBuffer(ctx context.Context, writeBuffe
 		return err
 	}
 
-	if err := writeBuffer.WriteString("ckp", uint32(len("<redacted>")*8), "<redacted>", utils.WithEncoding("UTF-8")); err != nil {
+	if err := writeBuffer.WriteString("certDirectory", uint32(len(d.CertDirectory)*8), d.CertDirectory, utils.WithEncoding("UTF-8")); err != nil {
+		return err
+	}
+
+	if err := writeBuffer.WriteInt64("generatedKeySize", 64, int64(d.GeneratedKeySize)); err != nil {
+		return err
+	}
+
+	if err := writeBuffer.WriteString("serverCertificateFile", uint32(len(d.ServerCertificateFile)*8), d.ServerCertificateFile, utils.WithEncoding("UTF-8")); err != nil {
+		return err
+	}
+
+	if err := writeBuffer.WriteString("trustStore", uint32(len(d.TrustStore)*8), d.TrustStore, utils.WithEncoding("UTF-8")); err != nil {
+		return err
+	}
+
+	if err := writeBuffer.WriteBit("verifyServerCertificate", d.VerifyServerCertificate); err != nil {
+		return err
+	}
+
+	if err := writeBuffer.WriteBit("allowInsecureCredentials", d.AllowInsecureCredentials); err != nil {
+		return err
+	}
+
+	if err := writeBuffer.WriteInt64("browseMaxReferencesPerNode", 64, int64(d.BrowseMaxReferencesPerNode)); err != nil {
+		return err
+	}
+
+	if err := writeBuffer.WriteInt64("browseMaxTotalNodes", 64, int64(d.BrowseMaxTotalNodes)); err != nil {
+		return err
+	}
+
+	if err := writeBuffer.WriteInt64("browseMaxDepth", 64, int64(d.BrowseMaxDepth)); err != nil {
 		return err
 	}
 

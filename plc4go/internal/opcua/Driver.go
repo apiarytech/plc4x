@@ -135,15 +135,6 @@ func (d *Driver) GetConnection(ctx context.Context, transportUrl url.URL, transp
 	configuration.Endpoint = "opc." + transportCode + "://" + transportHost + portAddition + "" + transportEndpoint
 	connectionLog.Debug().Interface("configuration", &configuration).Msg("working with configuration")
 
-	if securityPolicy := configuration.SecurityPolicy; securityPolicy != "" && securityPolicy != "None" {
-		connectionLog.Trace().Str("securityPolicy", securityPolicy).Msg("working with security policy")
-		if err := configuration.openKeyStore(); err != nil {
-			return nil, errors.Wrap(err, "error opening key store")
-		}
-	} else {
-		connectionLog.Trace().Msg("no security policy")
-	}
-
 	driverContext := NewDriverContext(configuration)
 	driverContext.awaitSetupComplete = d.awaitSetupComplete
 	driverContext.awaitDisconnectComplete = d.awaitDisconnectComplete
@@ -163,6 +154,17 @@ func (d *Driver) GetConnection(ctx context.Context, transportUrl url.URL, transp
 		driverOptions,
 		append(d._options, options.WithCustomLogger(connectionLog))...,
 	)
+	connection.newDiscoveryCodec = func() (*MessageCodec, error) {
+		discoveryTransportInstance, err := transport.CreateTransportInstance(
+			transportUrl,
+			driverOptions,
+			append(d._options, options.WithCustomLogger(connectionLog))...,
+		)
+		if err != nil {
+			return nil, err
+		}
+		return NewMessageCodec(discoveryTransportInstance, append(d._options, options.WithCustomLogger(connectionLog))...), nil
+	}
 	connectionLog.Debug().Msg("created connection, connecting now")
 	if err := connection.Connect(ctx); err != nil {
 		return nil, errors.Wrap(err, "Error connecting connection")

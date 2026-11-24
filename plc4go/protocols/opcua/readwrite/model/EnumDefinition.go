@@ -171,7 +171,7 @@ func (b *_EnumDefinition) CreateEnumDefinitionBuilder() EnumDefinitionBuilder {
 ///////////////////////
 
 func (m *_EnumDefinition) GetExtensionId() int32 {
-	return int32(102)
+	return int32(123)
 }
 
 ///////////////////////

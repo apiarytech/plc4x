@@ -5038,11 +5038,11 @@ func (m *_ExtensionObjectDefinition) parse(ctx context.Context, readBuffer utils
 		if _child, err = new(_StructureField).parse(ctx, readBuffer, m, int32(extensionId)); err != nil {
 			return nil, errors.Wrap(err, "Error parsing sub-type StructureField for type-switch of ExtensionObjectDefinition")
 		}
-	case extensionId == int32(101): // StructureDefinition
+	case extensionId == int32(122): // StructureDefinition
 		if _child, err = new(_StructureDefinition).parse(ctx, readBuffer, m, int32(extensionId)); err != nil {
 			return nil, errors.Wrap(err, "Error parsing sub-type StructureDefinition for type-switch of ExtensionObjectDefinition")
 		}
-	case extensionId == int32(102): // EnumDefinition
+	case extensionId == int32(123): // EnumDefinition
 		if _child, err = new(_EnumDefinition).parse(ctx, readBuffer, m, int32(extensionId)); err != nil {
 			return nil, errors.Wrap(err, "Error parsing sub-type EnumDefinition for type-switch of ExtensionObjectDefinition")
 		}

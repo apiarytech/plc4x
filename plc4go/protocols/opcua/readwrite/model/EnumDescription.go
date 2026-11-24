@@ -356,7 +356,7 @@ func (m *_EnumDescription) parse(ctx context.Context, readBuffer utils.ReadBuffe
 	}
 	m.Name = name
 
-	enumDefinition, err := ReadSimpleField[EnumDefinition](ctx, "enumDefinition", ReadComplex[EnumDefinition](ExtensionObjectDefinitionParseWithBufferProducer[EnumDefinition]((int32)(int32(102))), readBuffer), codegen.WithEncoding("UTF8"))
+	enumDefinition, err := ReadSimpleField[EnumDefinition](ctx, "enumDefinition", ReadComplex[EnumDefinition](ExtensionObjectDefinitionParseWithBufferProducer[EnumDefinition]((int32)(int32(123))), readBuffer), codegen.WithEncoding("UTF8"))
 	if err != nil {
 		return nil, errors.Wrap(err, fmt.Sprintf("Error parsing 'enumDefinition' field"))
 	}

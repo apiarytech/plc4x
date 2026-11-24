@@ -17,37 +17,20 @@
  * under the License.
  */
 
-package opcua
+package model
 
-import (
-	"crypto/rsa"
-	"crypto/sha1"
-	"crypto/x509"
-)
+import "context"
 
-type CertificateKeyPair struct {
-	keyPair     *rsa.PrivateKey
-	certificate *x509.Certificate
-	thumbprint  []byte
-}
-
-func NewCertificateKeyPair(keyPair *rsa.PrivateKey, certificate *x509.Certificate) *CertificateKeyPair {
-	thumbprint := sha1.Sum(certificate.Raw)
-	return &CertificateKeyPair{
-		keyPair:     keyPair,
-		certificate: certificate,
-		thumbprint:  thumbprint[:],
+// Count computes the 2 bit size field of an SDO initiate upload response or
+// download request. Ported from plc4j StaticHelper.count: for an expedited,
+// size-indicated transfer carrying its data inline (at most 4 bytes), size is
+// the number of unused bytes, 4 - len(data); for every other payload it is 0.
+func Count(_ context.Context, expedited bool, indicated bool, payload SDOInitiateUploadResponsePayload) uint8 {
+	if !expedited || !indicated {
+		return 0
 	}
-}
-
-func (p *CertificateKeyPair) getKeyPair() *rsa.PrivateKey {
-	return p.keyPair
-}
-
-func (p *CertificateKeyPair) getCertificate() *x509.Certificate {
-	return p.certificate
-}
-
-func (p *CertificateKeyPair) getThumbprint() []byte {
-	return p.thumbprint
+	if inline, ok := payload.(SDOInitiateExpeditedUploadResponse); ok {
+		return uint8(4 - len(inline.GetData()))
+	}
+	return 0
 }

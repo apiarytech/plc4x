@@ -21,7 +21,6 @@ package opcua
 
 import (
 	"context"
-	"encoding/binary"
 	"runtime/debug"
 	"sync"
 	"time"
@@ -43,7 +42,8 @@ type Subscriber struct {
 	connection    *Connection
 	subscriptions map[uint32]*SubscriptionHandle `ignore:"true"` // TODO: we don't have support for non string key maps yet
 
-	consumersMutex sync.RWMutex
+	consumersMutex     sync.RWMutex
+	subscriptionsMutex sync.Mutex
 
 	log      zerolog.Logger       `ignore:"true"`
 	_options []options.WithOption `ignore:"true"` // Used to pass them downstream
@@ -74,36 +74,63 @@ func (s *Subscriber) subscribeSync(ctx context.Context, result chan apiModel.Plc
 			utils.DeliverResult(s.log, result, spiModel.NewDefaultPlcSubscriptionRequestResult(subscriptionRequest, nil, errors.Errorf("panic-ed %v. Stack: %s", err, debug.Stack())))
 		}
 	}()
+	fail := func(err error) {
+		utils.DeliverResult(s.log, result, spiModel.NewDefaultPlcSubscriptionRequestResult(subscriptionRequest, nil, err))
+	}
 	internalPlcSubscriptionRequest := subscriptionRequest.(*spiModel.DefaultPlcSubscriptionRequest)
+	tagNames := internalPlcSubscriptionRequest.GetTagNames()
+	if len(tagNames) == 0 {
+		fail(errors.New("no tags to subscribe to"))
+		return
+	}
 
-	cycleTime := subscriptionRequest.GetTag(subscriptionRequest.GetTagNames()[0]).GetDuration()
+	// The subscription publishes at the shortest interval its tags ask for.
+	cycleTime := time.Duration(0)
+	for _, name := range tagNames {
+		if interval := internalPlcSubscriptionRequest.GetInterval(name); interval > 0 && (cycleTime == 0 || interval < cycleTime) {
+			cycleTime = interval
+		}
+	}
 	if cycleTime == 0 {
-		cycleTime = 1 * time.Second
+		cycleTime = SUBSCRIPTION_DEFAULT_INTERVAL
 	}
 
 	subscription, err := s.onSubscribeCreateSubscription(ctx, cycleTime)
 	if err != nil {
-		utils.DeliverResult(s.log, result, spiModel.NewDefaultPlcSubscriptionRequestResult(subscriptionRequest, nil, errors.Wrap(err, "error create subscription")))
+		fail(errors.Wrap(err, "error creating the subscription"))
 		return
 	}
 	subscriptionId := subscription.GetSubscriptionId()
-	handle := NewSubscriptionHandle(s.log, s, s.connection, subscriptionRequest, subscriptionId, cycleTime)
+	revisedCycleTime := time.Duration(subscription.GetRevisedPublishingInterval() * float64(time.Millisecond))
+	if revisedCycleTime <= 0 {
+		revisedCycleTime = cycleTime
+	}
+	keepAliveCount := subscription.GetRevisedMaxKeepAliveCount()
+	if keepAliveCount == 0 {
+		keepAliveCount = SUBSCRIPTION_KEEP_ALIVE_COUNT
+	}
+	handle, err := NewSubscriptionHandle(s.log, s, s.connection, subscriptionRequest, subscriptionId, cycleTime, revisedCycleTime, keepAliveCount)
+	if err != nil {
+		s.deleteSubscription(subscriptionId)
+		fail(err)
+		return
+	}
+	s.subscriptionsMutex.Lock()
 	s.subscriptions[subscriptionId] = handle
+	s.subscriptionsMutex.Unlock()
 
 	// Add this subscriber to the connection.
 	s.addSubscriber(s)
 
-	// Just populate all requests with an OK
-	responseCodes := map[string]apiModel.PlcResponseCode{}
+	responseCodes := handle.responseCodes()
 	subscriptionValues := make(map[string]apiModel.PlcSubscriptionHandle)
-	for _, tagName := range internalPlcSubscriptionRequest.GetTagNames() {
-		responseCodes[tagName] = apiModel.PlcResponseCode_OK
-		preRegisteredConsumers := internalPlcSubscriptionRequest.GetPreRegisteredConsumers(tagName)
-		for _, consumer := range preRegisteredConsumers {
+	for _, tagName := range tagNames {
+		for _, consumer := range internalPlcSubscriptionRequest.GetPreRegisteredConsumers(tagName) {
 			_ = handle.Register(consumer)
 		}
 		subscriptionValues[tagName] = handle
 	}
+	handle.startSubscriber()
 
 	utils.DeliverResult(s.log, result, spiModel.NewDefaultPlcSubscriptionRequestResult(
 		subscriptionRequest,
@@ -117,95 +144,84 @@ func (s *Subscriber) subscribeSync(ctx context.Context, result chan apiModel.Plc
 	))
 }
 
+// onSubscribeCreateSubscription creates a subscription publishing every cycleTime.
 func (s *Subscriber) onSubscribeCreateSubscription(ctx context.Context, cycleTime time.Duration) (readWriteModel.CreateSubscriptionResponse, error) {
-	s.log.Trace().Msg("Entering creating subscription request")
-
 	channel := s.connection.channel
-
-	requestHeader := readWriteModel.NewRequestHeader(channel.getAuthenticationToken(),
-		channel.getCurrentDateTime(),
-		channel.getRequestHandle(),
-		0,
-		NULL_STRING,
-		REQUEST_TIMEOUT_LONG,
-		NULL_EXTENSION_OBJECT)
-
-	createSubscriptionRequest := readWriteModel.NewCreateSubscriptionRequest(
-		requestHeader,
-		float64(cycleTime),
-		12000,
-		5,
-		65536,
+	ctx, cancel := context.WithTimeout(ctx, REQUEST_TIMEOUT_LONG*time.Millisecond)
+	defer cancel()
+	response, err := channel.call(ctx, s.connection.messageCodec, readWriteModel.NewCreateSubscriptionRequest(
+		channel.newRequestHeader(channel.getRequestHandle()),
+		float64(cycleTime)/float64(time.Millisecond),
+		SUBSCRIPTION_LIFETIME_COUNT,
+		SUBSCRIPTION_KEEP_ALIVE_COUNT,
+		0, // as many notifications per Publish as there are
 		true,
 		0,
-	)
-
-	identifier := createSubscriptionRequest.GetExtensionId()
-	expandedNodeId := readWriteModel.NewExpandedNodeId(false, //Namespace Uri Specified
-		false, //Server Index Specified
-		readWriteModel.NewNodeIdFourByte(0, uint16(identifier)),
-		nil,
-		nil)
-
-	extObject := readWriteModel.NewExtensiblePayload(
-		nil,
-		readWriteModel.NewRootExtensionObject(
-			expandedNodeId, createSubscriptionRequest,
-		),
-	)
-
-	buffer := utils.NewWriteBufferByteBased(utils.WithByteOrderForByteBasedBuffer(binary.LittleEndian))
-	if err := extObject.SerializeWithWriteBuffer(ctx, buffer); err != nil {
-		return nil, errors.Wrap(err, "error serializing")
+	))
+	if err != nil {
+		return nil, err
 	}
-
-	responseChan := make(chan readWriteModel.CreateSubscriptionResponse, 100) // TODO: bit oversized to not block anything. Discards errors
-	errorChan := make(chan error, 100)                                        // TODO: bit oversized to not block anything. Discards errors
-	/* Functional Consumer example using inner class */
-	consumer := func(opcuaResponse []byte) {
-		extensionObject, err := readWriteModel.ExtensionObjectParseWithBuffer[readWriteModel.ExtensionObject](ctx, utils.NewReadBufferByteBased(opcuaResponse, utils.WithByteOrderForReadBufferByteBased(binary.LittleEndian)), false)
-		if err != nil {
-			errorChan <- errors.Wrap(err, "error Parsing")
-			return
-		}
-		responseMessage := extensionObject.GetBody().(readWriteModel.CreateSubscriptionResponse)
-
-		// Pass the response back to the application.
-		responseChan <- responseMessage
+	created, ok := response.(readWriteModel.CreateSubscriptionResponse)
+	if !ok {
+		return nil, errors.Errorf("unexpected response %T to CreateSubscription", response)
 	}
+	return created, nil
+}
 
-	errorDispatcher := func(err error) {
-		errorChan <- errors.Wrap(err, "error received")
+// deleteSubscription deletes a subscription that never got a handle.
+func (s *Subscriber) deleteSubscription(subscriptionId uint32) {
+	channel := s.connection.channel
+	ctx, cancel := context.WithTimeout(context.Background(), REQUEST_TIMEOUT_LONG*time.Millisecond)
+	defer cancel()
+	if _, err := channel.call(ctx, s.connection.messageCodec, readWriteModel.NewDeleteSubscriptionsRequest(
+		channel.newRequestHeader(channel.getRequestHandle()), []uint32{subscriptionId})); err != nil {
+		s.log.Debug().Err(err).Msg("DeleteSubscriptions failed")
 	}
-	channel.submit(ctx, s.connection.messageCodec, errorDispatcher, consumer, buffer)
+}
 
-	select {
-	case response := <-responseChan:
-		return response, nil
-	case err := <-errorChan:
-		return nil, errors.Wrap(err, "error received")
-	case <-ctx.Done():
-		return nil, errors.Wrap(ctx.Err(), "context ended")
+// subscriptionEnded forgets a subscription the server ended.
+func (s *Subscriber) subscriptionEnded(handle *SubscriptionHandle) {
+	s.subscriptionsMutex.Lock()
+	delete(s.subscriptions, handle.subscriptionId)
+	s.subscriptionsMutex.Unlock()
+	handle.cancel()
+}
+
+// stopAll deletes the subscriber's subscriptions, before the connection closes.
+func (s *Subscriber) stopAll() {
+	s.subscriptionsMutex.Lock()
+	handles := make([]*SubscriptionHandle, 0, len(s.subscriptions))
+	for id, handle := range s.subscriptions {
+		handles = append(handles, handle)
+		delete(s.subscriptions, id)
+	}
+	s.subscriptionsMutex.Unlock()
+	for _, handle := range handles {
+		handle.stopSubscriber()
 	}
 }
 
 func (s *Subscriber) onDisconnect() {
 	ctx := context.TODO()
 	s.log.Trace().Msg("disconnecting")
-	for _, handle := range s.subscriptions {
-		handle.stopSubscriber()
-	}
+	s.stopAll()
 	s.connection.channel.onDisconnect(ctx, s.connection)
 }
 
+// Unsubscribe deletes the subscriptions of the handles.
 func (s *Subscriber) Unsubscribe(ctx context.Context, unsubscriptionRequest apiModel.PlcUnsubscriptionRequest) <-chan apiModel.PlcUnsubscriptionRequestResult {
 	result := make(chan apiModel.PlcUnsubscriptionRequestResult, 1)
-	utils.DeliverResult(s.log, result, spiModel.NewDefaultPlcUnsubscriptionRequestResult(unsubscriptionRequest, nil, errors.New("Not Implemented")))
-
-	for _, handle := range unsubscriptionRequest.(*spiModel.DefaultPlcUnsubscriptionRequest).GetSubscriptionHandles() {
-		handle.(*SubscriptionHandle).stopSubscriber()
-	}
-
+	go func() {
+		for _, handle := range unsubscriptionRequest.(*spiModel.DefaultPlcUnsubscriptionRequest).GetSubscriptionHandles() {
+			if h, ok := handle.(*SubscriptionHandle); ok && h.plcSubscriber == s {
+				s.subscriptionsMutex.Lock()
+				delete(s.subscriptions, h.subscriptionId)
+				s.subscriptionsMutex.Unlock()
+				h.stopSubscriber()
+			}
+		}
+		utils.DeliverResult(s.log, result, spiModel.NewDefaultPlcUnsubscriptionRequestResult(unsubscriptionRequest, spiModel.NewDefaultPlcUnsubscriptionResponse(unsubscriptionRequest), nil))
+	}()
 	return result
 }
 
@@ -215,6 +231,22 @@ func (s *Subscriber) Register(consumer apiModel.PlcSubscriptionEventConsumer, ha
 	consumerRegistration := spiModel.NewDefaultPlcConsumerRegistration(s, consumer, handles...)
 	s.consumers[consumerRegistration.(*spiModel.DefaultPlcConsumerRegistration)] = consumer
 	return consumerRegistration
+}
+
+// consumersOf are the consumers registered on a handle.
+func (s *Subscriber) consumersOf(handle *SubscriptionHandle) []apiModel.PlcSubscriptionEventConsumer {
+	s.consumersMutex.RLock()
+	defer s.consumersMutex.RUnlock()
+	var out []apiModel.PlcSubscriptionEventConsumer
+	for registration, consumer := range s.consumers {
+		for _, h := range registration.GetSubscriptionHandles() {
+			if h == apiModel.PlcSubscriptionHandle(handle) {
+				out = append(out, consumer)
+				break
+			}
+		}
+	}
+	return out
 }
 
 func (s *Subscriber) Unregister(registration apiModel.PlcConsumerRegistration) {

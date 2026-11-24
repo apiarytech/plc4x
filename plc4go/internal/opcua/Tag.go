@@ -21,6 +21,7 @@ package opcua
 
 import (
 	"fmt"
+	"time"
 
 	apiModel "github.com/apache/plc4x/plc4go/pkg/api/model"
 	apiValues "github.com/apache/plc4x/plc4go/pkg/api/values"
@@ -48,11 +49,14 @@ type tag struct {
 	identifier     string
 	identifierType readWriteModel.OpcuaIdentifierType
 	dataType       readWriteModel.OpcuaDataType
+	arrayInfo      []apiModel.ArrayInfo // the shape a browse found, nil otherwise
 }
 
+// GetAddressString is the address the tag parses from: "ns=2;s=Line1", with ";DINT" when the
+// data type is known.
 func (t *tag) GetAddressString() string {
-	address := fmt.Sprintf("ns=%d;%s=%s", t.namespace, t.identifierType, t.identifier)
-	if t.dataType != "" {
+	address := fmt.Sprintf("ns=%d;%s=%s", t.namespace, t.identifierType.GetValue(), t.identifier)
+	if t.dataType != "" && t.dataType != readWriteModel.OpcuaDataType_NULL {
 		address += ";" + t.dataType.PLC4XEnumName()
 	}
 	return address
@@ -67,7 +71,7 @@ func (t *tag) GetValueType() apiValues.PlcValueType {
 }
 
 func (t *tag) GetArrayInfo() []apiModel.ArrayInfo {
-	return nil
+	return t.arrayInfo
 }
 
 func (t *tag) GetNamespace() int {
@@ -80,6 +84,17 @@ func (t *tag) GetIdentifier() string {
 
 func (t *tag) GetIdentifierType() readWriteModel.OpcuaIdentifierType {
 	return t.identifierType
+}
+
+// GetPlcSubscriptionType makes a tag usable in a subscription; the request says how it is
+// subscribed to.
+func (t *tag) GetPlcSubscriptionType() apiModel.PlcSubscriptionType {
+	return apiModel.SubscriptionChangeOfState
+}
+
+// GetDuration is the tag's own sampling interval: none, the request gives it.
+func (t *tag) GetDuration() time.Duration {
+	return 0
 }
 
 func (t *tag) String() string {

@@ -54,8 +54,14 @@ func (m TagHandler) ParseTag(tagAddress string) (apiModel.PlcTag, error) {
 	}
 }
 
-func (m TagHandler) ParseQuery(_ string) (apiModel.PlcQuery, error) {
-	return nil, errors.New("This driver doesn't support browsing")
+// ParseQuery reads a browse query: the address of the node to browse from ("ns=2;s=Line1"), or
+// empty or "**" for the Objects folder, as in PLC4J.
+func (m TagHandler) ParseQuery(query string) (apiModel.PlcQuery, error) {
+	browseQuery := Query{query: query}
+	if _, err := m.ParseTag(browseQuery.startAddress()); err != nil {
+		return nil, errors.Wrapf(err, "%q is not a node to browse from", query)
+	}
+	return browseQuery, nil
 }
 
 func (m TagHandler) handleTagAddress(match map[string]string) (apiModel.PlcTag, error) {
@@ -72,10 +78,10 @@ func (m TagHandler) handleTagAddress(match map[string]string) (apiModel.PlcTag, 
 		return nil, errors.Errorf("No identifier found for %s", match["identifierType"])
 	}
 	dataType := readWriteModel.OpcuaDataType_NULL
-	if dataTypeMatch := match["dataType"]; dataTypeMatch != "" {
+	if dataTypeMatch := match["datatype"]; dataTypeMatch != "" {
 		dataType, ok = readWriteModel.OpcuaDataTypeByName(dataTypeMatch)
 		if !ok {
-			return nil, errors.Errorf("No identifier found for %s", match["dataType"])
+			return nil, errors.Errorf("unknown data type %s", dataTypeMatch)
 		}
 	}
 	return NewTag(namespace, identifier, identifierType, dataType), nil

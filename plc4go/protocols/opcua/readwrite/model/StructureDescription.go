@@ -338,7 +338,7 @@ func (m *_StructureDescription) parse(ctx context.Context, readBuffer utils.Read
 	}
 	m.Name = name
 
-	structureDefinition, err := ReadSimpleField[StructureDefinition](ctx, "structureDefinition", ReadComplex[StructureDefinition](ExtensionObjectDefinitionParseWithBufferProducer[StructureDefinition]((int32)(int32(101))), readBuffer), codegen.WithEncoding("UTF8"))
+	structureDefinition, err := ReadSimpleField[StructureDefinition](ctx, "structureDefinition", ReadComplex[StructureDefinition](ExtensionObjectDefinitionParseWithBufferProducer[StructureDefinition]((int32)(int32(122))), readBuffer), codegen.WithEncoding("UTF8"))
 	if err != nil {
 		return nil, errors.Wrap(err, fmt.Sprintf("Error parsing 'structureDefinition' field"))
 	}

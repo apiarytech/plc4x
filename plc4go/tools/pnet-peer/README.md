@@ -37,3 +37,6 @@ Notes:
 - `PNET_ARGS` adds arguments to `pn_dev`, e.g. `-e PNET_ARGS=-vvv` for the sample application's
   own log. Its output to a file is block buffered, so lines can be missing when the container
   stops; run it under `stdbuf -oL` to see everything.
+- `-e PROFINET_TEST_RPC_FRAGMENT_SIZE=128` sets the connection option `rpc-fragment-size`, so the
+  connect requests go out as DCE/RPC fragments, which p-net acknowledges and reassembles. Its
+  Connect would otherwise fit one datagram.

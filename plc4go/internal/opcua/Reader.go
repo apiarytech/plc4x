@@ -121,17 +121,7 @@ func (m *Reader) readSync(ctx context.Context, readRequest apiModel.PlcReadReque
 			utils.DeliverResult(m.log, result, spiModel.NewDefaultPlcReadRequestResult(readRequest, spiModel.NewDefaultPlcReadResponse(readResponse(m.log, readRequest, readRequest.GetTagNames(), _readResponse.GetResults())), nil))
 			return
 		} else {
-			if serviceFault, ok := extensionObjectDefinition.(readWriteModel.ServiceFault); ok {
-				header := serviceFault.GetResponseHeader()
-				m.log.Error().Interface("header", header).Msg("Read request ended up with ServiceFault")
-			} else {
-				m.log.Error().Interface("extensionObjectDefinition", extensionObjectDefinition).Msg("Remote party returned an error")
-			}
-
-			responseCodes := map[string]apiModel.PlcResponseCode{}
-			for _, tagName := range readRequest.GetTagNames() {
-				responseCodes[tagName] = apiModel.PlcResponseCode_INTERNAL_ERROR
-			}
+			responseCodes := failedResponseCodes(m.log, "Read", readRequest.GetTagNames(), extensionObjectDefinition)
 			utils.DeliverResult(m.log, result, spiModel.NewDefaultPlcReadRequestResult(readRequest, spiModel.NewDefaultPlcReadResponse(readRequest, responseCodes, nil), nil))
 		}
 	}

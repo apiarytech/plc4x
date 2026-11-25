@@ -273,3 +273,32 @@ func responseCodeOf(status uint32) apiModel.PlcResponseCode {
 	}
 	return apiModel.PlcResponseCode_REMOTE_ERROR
 }
+
+// failedResponseCodes are the response codes of every tag of a request the
+// server answered with something other than its response. A ServiceFault
+// carries the server's reason in its service result, mapped as a value's
+// status is (responseCodeOf): a write the server refuses for the user's
+// rights is ACCESS_DENIED, not INTERNAL_ERROR, so whoever reads the result
+// sees why. Anything else is INTERNAL_ERROR. What the server answered is
+// logged, the status by name.
+func failedResponseCodes(log zerolog.Logger, request string, tagNames []string, body readWriteModel.ExtensionObjectDefinition) map[string]apiModel.PlcResponseCode {
+	code := apiModel.PlcResponseCode_INTERNAL_ERROR
+	if fault, ok := body.(readWriteModel.ServiceFault); ok && fault.GetResponseHeader() != nil && fault.GetResponseHeader().GetServiceResult() != nil {
+		status := fault.GetResponseHeader().GetServiceResult().GetStatusCode()
+		if c := responseCodeOf(status); c != apiModel.PlcResponseCode_OK {
+			code = c
+		}
+		name := fmt.Sprintf("0x%08X", status)
+		if s, ok := readWriteModel.OpcuaStatusCodeByValue(status & 0xFFFF0000); ok {
+			name = s.PLC4XEnumName() + " (" + name + ")"
+		}
+		log.Error().Str("serviceResult", name).Stringer("responseCode", code).Msg(request + " request ended with a ServiceFault")
+	} else {
+		log.Error().Interface("reply", body).Msg(request + " request: the server returned an error")
+	}
+	codes := make(map[string]apiModel.PlcResponseCode, len(tagNames))
+	for _, tagName := range tagNames {
+		codes[tagName] = code
+	}
+	return codes
+}

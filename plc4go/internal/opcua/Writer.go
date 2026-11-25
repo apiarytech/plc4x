@@ -142,17 +142,7 @@ func (m *Writer) WriteSync(ctx context.Context, writeRequest apiModel.PlcWriteRe
 			utils.DeliverResult(m.log, result, spiModel.NewDefaultPlcWriteRequestResult(writeRequest, spiModel.NewDefaultPlcWriteResponse(m.writeResponse(writeRequest, writeResponse.GetResults())), nil))
 			return
 		} else {
-			if serviceFault, ok := body.(readWriteModel.ServiceFault); ok {
-				header := serviceFault.GetResponseHeader()
-				m.log.Error().Interface("header", header).Msg("Read request ended up with ServiceFault")
-			} else {
-				m.log.Error().Interface("reply", reply).Msg("Remote party returned an error")
-			}
-
-			responseCodes := map[string]apiModel.PlcResponseCode{}
-			for _, tagName := range writeRequest.GetTagNames() {
-				responseCodes[tagName] = apiModel.PlcResponseCode_INTERNAL_ERROR
-			}
+			responseCodes := failedResponseCodes(m.log, "Write", writeRequest.GetTagNames(), body)
 			utils.DeliverResult(m.log, result, spiModel.NewDefaultPlcWriteRequestResult(writeRequest, spiModel.NewDefaultPlcWriteResponse(writeRequest, responseCodes), nil))
 		}
 	}

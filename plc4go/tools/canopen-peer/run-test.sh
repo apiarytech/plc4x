@@ -13,6 +13,9 @@ set -e
 ip link add dev vcan0 type vcan
 ip link set up vcan0
 mkdir -p /tmp/canopend
+# canopend reports a storage error (EMCY 0x5000) and refuses NMT start when its storage files are
+# missing; a file holding "-" says "no stored data, use the defaults".
+for f in od_comm.persist mainline.persist; do echo - > /tmp/canopend/$f; done
 candump -L vcan0 > /tmp/candump.log 2>&1 &
 (cd /tmp/canopend && canopend vcan0 -i 0x21 > /tmp/canopend.log 2>&1 &)
 /opt/canopen/bin/python3 /src/plc4go/tools/canopen-peer/python_node.py vcan0 0x22 > /tmp/python_node.log 2>&1 &

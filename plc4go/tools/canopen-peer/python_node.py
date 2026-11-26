@@ -58,7 +58,7 @@ def dictionary():
 def main():
     interface, node_id = sys.argv[1], int(sys.argv[2], 0)
     network = canopen.Network()
-    network.connect(interface=interface, interface_type="socketcan")
+    network.connect(channel=interface, interface="socketcan")
     node = network.create_node(node_id, dictionary())
     node.nmt.state = "PRE-OPERATIONAL"
     network.send_message(0x700 + node_id, [0x00])  # boot-up

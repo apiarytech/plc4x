@@ -73,6 +73,15 @@ func readResponse(localLog zerolog.Logger, readRequestIn apiModel.PlcReadRequest
 	for _, tagName := range tagNames {
 		responseCode := apiModel.PlcResponseCode_OK
 		var value apiValues.PlcValue
+		// A bad status says the value is not to be used, whatever the server put beside it:
+		// some servers (asyncua) send a null value with BadNodeIdUnknown.
+		if result := results[count]; result.GetStatusCodeSpecified() && result.GetStatusCode() != nil && result.GetStatusCode().GetStatusCode()&0x80000000 != 0 {
+			responseCodes[tagName] = responseCodeOf(result.GetStatusCode().GetStatusCode())
+			values[tagName] = nil
+			localLog.Debug().Stringer("status", readWriteModel.OpcuaStatusCode(result.GetStatusCode().GetStatusCode()&0xFFFF0000)).Str("tag", tagName).Msg("The server refused to read the tag")
+			count++
+			continue
+		}
 		if results[count].GetValueSpecified() {
 			variant := results[count].GetValue()
 			localLog.Trace().Type("type", variant).Msg("Response of type")

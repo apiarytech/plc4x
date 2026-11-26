@@ -125,23 +125,20 @@ func (s *Subscriber) subscribeSync(ctx context.Context, result chan apiModel.Plc
 	responseCodes := handle.responseCodes()
 	subscriptionValues := make(map[string]apiModel.PlcSubscriptionHandle)
 	for _, tagName := range tagNames {
-		for _, consumer := range internalPlcSubscriptionRequest.GetPreRegisteredConsumers(tagName) {
-			_ = handle.Register(consumer)
-		}
 		subscriptionValues[tagName] = handle
 	}
+	// The response registers the request's pre-registered consumers on the handle. Registering
+	// them here as well delivered every value to each of them twice. The Publish loops start
+	// after, so no value arrives before its consumers are registered.
+	response := spiModel.NewDefaultPlcSubscriptionResponse(
+		subscriptionRequest,
+		responseCodes,
+		subscriptionValues,
+		append(s._options, options.WithCustomLogger(s.log))...,
+	)
 	handle.startSubscriber()
 
-	utils.DeliverResult(s.log, result, spiModel.NewDefaultPlcSubscriptionRequestResult(
-		subscriptionRequest,
-		spiModel.NewDefaultPlcSubscriptionResponse(
-			subscriptionRequest,
-			responseCodes,
-			subscriptionValues,
-			append(s._options, options.WithCustomLogger(s.log))...,
-		),
-		nil,
-	))
+	utils.DeliverResult(s.log, result, spiModel.NewDefaultPlcSubscriptionRequestResult(subscriptionRequest, response, nil))
 }
 
 // onSubscribeCreateSubscription creates a subscription publishing every cycleTime.
